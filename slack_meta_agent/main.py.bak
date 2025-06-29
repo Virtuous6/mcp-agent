@@ -37,9 +37,6 @@ from slack_meta_agent.universal_mcp_strategy import (
     print_exploration_results,
 )
 
-# Direct Supabase client for reliability
-from supabase_direct_client import SupabaseDirectClient
-
 # Slack integration imports
 try:
     from slack_sdk.socket_mode import SocketModeClient
@@ -128,71 +125,6 @@ class SlackMetaAgent:
         self.mcp_app = (
             mcp_app  # Store MCPApp instance for proper server registry access
         )
-
-        # Initialize direct Supabase client for reliability
-        self.supabase_direct_client: Optional[SupabaseDirectClient] = None
-        if supabase_project_id:
-            try:
-                # Try to get keys from mcp_agent.secrets.yaml first, then environment
-                anon_key = None
-                service_role_key = None
-
-                # Load from secrets YAML file
-                secrets_file = "mcp_agent.secrets.yaml"
-                if os.path.exists(secrets_file):
-                    import yaml
-
-                    with open(secrets_file, "r") as f:
-                        secrets = yaml.safe_load(f)
-                        if "supabase" in secrets:
-                            anon_key = secrets["supabase"].get("anon_key")
-                            service_role_key = secrets["supabase"].get(
-                                "service_role_key"
-                            )
-                            self.logger.info(
-                                "📄 Loaded Supabase credentials from mcp_agent.secrets.yaml"
-                            )
-
-                # Fallback to environment variables
-                if not anon_key and not service_role_key:
-                    anon_key = os.getenv("SUPABASE_ANON_KEY")
-                    service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-                    if anon_key or service_role_key:
-                        self.logger.info(
-                            "🌍 Using Supabase credentials from environment variables"
-                        )
-
-                if anon_key or service_role_key:
-                    self.supabase_direct_client = SupabaseDirectClient(
-                        project_id=supabase_project_id,
-                        anon_key=anon_key,
-                        service_role_key=service_role_key,
-                    )
-                    self.logger.info(
-                        "✅ Direct Supabase client initialized for reliable operations"
-                    )
-
-                    # Test the direct client and disable logging if it fails
-                    try:
-                        import asyncio
-
-                        # Quick health check
-                        health = asyncio.create_task(
-                            self.supabase_direct_client.health_check()
-                        )
-                        # Don't await here as it would block initialization
-                    except Exception as health_error:
-                        self.logger.warning(
-                            f"⚠️ Direct client health check failed: {health_error}"
-                        )
-                else:
-                    self.logger.warning(
-                        "⚠️ Supabase keys not found in secrets file or environment - direct client disabled"
-                    )
-            except Exception as e:
-                self.logger.warning(
-                    f"⚠️ Could not initialize direct Supabase client: {e}"
-                )
 
         # Dynamic tool discovery cache
         self.discovered_tools: Optional[Dict[str, Dict]] = None
@@ -413,19 +345,6 @@ class SlackMetaAgent:
             "add mcp server",
             "register mcp server",
             "create mcp server",
-            "i'd like to add",
-            "i want to add",
-            "i need to add",
-            "like to add",
-            "want to add",
-            "need to add",
-            "i have an mcp server",
-            "i have a server",
-            "add a server",
-            "add an mcp",
-            "to add",
-            "server to add",
-            "mcp to add",
         ]
 
         # Check for action + server patterns
@@ -2811,7 +2730,7 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
     async def _store_conversation_memory(
         self, user_id: str, message: str, channel_id: str
     ):
-        """Store conversation in Supabase memory with direct client fallback"""
+        """Store conversation in Supabase memory as shown in sequence diagram"""
         if user_id not in self.conversation_memory:
             self.conversation_memory[user_id] = []
 
@@ -2824,23 +2743,9 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
         self.conversation_memory[user_id].append(conversation_entry)
 
-        # Try direct Supabase client first for reliability
+        # Store in Supabase via direct MCP function call
         try:
-            if self.supabase_direct_client:
-                result = await self.supabase_direct_client.log_conversation_memory(
-                    user_id, message, channel_id
-                )
-                if result["success"]:
-                    self.logger.info(
-                        f"✅ Stored conversation memory for user {user_id} via direct client"
-                    )
-                    return
-                else:
-                    self.logger.warning(
-                        f"⚠️ Direct memory logging failed: {result['error']}, falling back to MCP"
-                    )
-
-            # Fallback to MCP method
+            # Use the available MCP function directly
             query = f"""INSERT INTO interactions (user_id, channel_id, message, created_at) 
                        VALUES ('{user_id}', '{channel_id}', '{message.replace("'", "''")}', '{conversation_entry["timestamp"]}');"""
 
@@ -2896,24 +2801,8 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
     async def _store_interaction_learning(
         self, user_id: str, message: str, result: str, analysis: Dict
     ):
-        """Store interaction for system learning with direct client fallback"""
+        """Store interaction for system learning as shown in sequence diagram"""
         try:
-            # Try direct Supabase client first for reliability
-            if self.supabase_direct_client:
-                direct_result = await self.supabase_direct_client.log_interaction(
-                    user_id, message, result, analysis
-                )
-                if direct_result["success"]:
-                    self.logger.info(
-                        f"✅ Stored interaction learning for user {user_id} via direct client"
-                    )
-                    return
-                else:
-                    self.logger.warning(
-                        f"⚠️ Direct interaction logging failed: {direct_result['error']}, falling back to MCP"
-                    )
-
-            # Fallback to MCP method
             # Prepare the query with proper escaping
             analysis_json = json.dumps(analysis).replace("'", "''")
             result_escaped = result.replace("'", "''")
@@ -4168,48 +4057,20 @@ The server is now available for use! You can reference it in future requests.
     async def _add_server_to_database(
         self, server_info: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Add the MCP server configuration to the Supabase database using direct client"""
+        """Add the MCP server configuration to the Supabase database using direct MCP tools"""
         try:
-            # Use direct Supabase client if available
-            if self.supabase_direct_client:
-                self.logger.info(
-                    "🚀 Using direct Supabase client for reliable server addition"
-                )
+            # Import Supabase MCP tools directly
+            from mcp_agent.mcp.gen_client import GeneratedClient
 
-                # Add the server directly
-                result = await self.supabase_direct_client.insert_mcp_server(
-                    server_info
-                )
+            # Step 1: Ensure we have an active configuration
+            config_query = """
+            INSERT INTO mcp_configurations (name, description, is_active, created_at, updated_at)
+            VALUES ('user_added_servers', 'User-added MCP servers from Slack', true, NOW(), NOW())
+            ON CONFLICT (name) DO UPDATE SET updated_at = NOW()
+            RETURNING id;
+            """
 
-                if result["success"]:
-                    # Verify the server was added
-                    verify_result = (
-                        await self.supabase_direct_client.verify_server_exists(
-                            server_info["server_name"]
-                        )
-                    )
-
-                    if verify_result["success"] and verify_result["exists"]:
-                        return {
-                            "success": True,
-                            "server_id": result.get("server_id", "unknown"),
-                            "message": f"✅ Server '{server_info['server_name']}' added successfully via direct client",
-                            "details": verify_result["data"],
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "error": f"Server added but verification failed: {verify_result.get('error', 'Unknown error')}",
-                            "details": result,
-                        }
-                else:
-                    self.logger.warning(
-                        f"⚠️ Direct client failed: {result['error']}, falling back to MCP method"
-                    )
-                    # Fall through to MCP method
-
-            # Fallback to MCP method if direct client is unavailable or failed
-            self.logger.info("🔄 Falling back to MCP-based server addition")
+            self.logger.info("🗄️ Creating/updating MCP configuration...")
 
             # Create agent for database operations
             db_agent = Agent(
@@ -4222,91 +4083,96 @@ The server is now available for use! You can reference it in future requests.
             async with db_agent:
                 llm = await db_agent.attach_llm(OpenAIAugmentedLLM)
 
-                # Step 1: Ensure configuration exists
-                config_prompt = f"""Execute this SQL to ensure the configuration exists:
+                # Execute configuration query using proper prompt structure
+                config_prompt = f"""Execute this SQL query to create/update the MCP configuration:
 
-                Project ID: {self.supabase_project_id}
+Project ID: {self.supabase_project_id}
+Query: {config_query}
 
-                INSERT INTO mcp_configurations (name, description, is_active, created_at, updated_at)
-                VALUES ('user_added_servers', 'User-added MCP servers from Slack', true, NOW(), NOW())
-                ON CONFLICT (name) DO UPDATE SET updated_at = NOW()
-                RETURNING id;
-
-                Use the execute_sql tool to run this query."""
+Use the execute_sql tool to run this query."""
 
                 config_result = await llm.generate_str(config_prompt)
                 self.logger.info(f"✅ Configuration result: {config_result}")
 
-                # Step 2: Insert the server
-                server_name = server_info["server_name"].replace("'", "''")
-                display_name = server_info.get("display_name", server_name).replace(
-                    "'", "''"
-                )
-                description = server_info.get("description", "").replace("'", "''")
-                transport = server_info["transport"]
-                url = (
-                    server_info.get("url", "").replace("'", "''")
-                    if server_info.get("url")
-                    else None
-                )
-                command = (
-                    server_info.get("command", "").replace("'", "''")
-                    if server_info.get("command")
-                    else None
-                )
-                args = json.dumps(server_info.get("args", [])).replace("'", "''")
+            # Step 2: Prepare server insertion data
+            server_name = server_info["server_name"].replace("'", "''")
+            display_name = server_info["display_name"].replace("'", "''")
+            description = server_info["description"].replace("'", "''")
+            transport = server_info["transport"]
+            url = (
+                server_info.get("url", "").replace("'", "''")
+                if server_info.get("url")
+                else None
+            )
+            command = (
+                server_info.get("command", "").replace("'", "''")
+                if server_info.get("command")
+                else None
+            )
+            args = json.dumps(server_info.get("args", [])).replace("'", "''")
 
-                server_prompt = f"""Execute this SQL to add the MCP server:
+            server_query = f"""
+            INSERT INTO mcp_servers (
+                configuration_id,
+                server_name,
+                display_name,
+                description,
+                transport,
+                url,
+                command,
+                args,
+                is_enabled,
+                priority,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                (SELECT id FROM mcp_configurations WHERE name = 'user_added_servers' LIMIT 1),
+                '{server_name}',
+                '{display_name}',
+                '{description}',
+                '{transport}',
+                {f"'{url}'" if url else "NULL"},
+                {f"'{command}'" if command else "NULL"},
+                '{args}'::jsonb,
+                true,
+                100,
+                NOW(),
+                NOW()
+            )
+            RETURNING id, server_name;
+            """
 
-                Project ID: {self.supabase_project_id}
+                self.logger.info(f"🚀 Adding server '{server_name}' to database...")
 
-                INSERT INTO mcp_servers (
-                    configuration_id,
-                    server_name,
-                    display_name,
-                    description,
-                    transport,
-                    url,
-                    command,
-                    args,
-                    is_enabled,
-                    priority,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    (SELECT id FROM mcp_configurations WHERE name = 'user_added_servers' LIMIT 1),
-                    '{server_name}',
-                    '{display_name}',
-                    '{description}',
-                    '{transport}',
-                    {f"'{url}'" if url else "NULL"},
-                    {f"'{command}'" if command else "NULL"},
-                    '{args}'::jsonb,
-                    true,
-                    100,
-                    NOW(),
-                    NOW()
-                )
-                RETURNING id, server_name;
+                # Execute server insertion query
+                server_prompt = f"""Execute this SQL query to add the MCP server:
 
-                Use the execute_sql tool to run this query."""
+Project ID: {self.supabase_project_id}
+Query: {server_query}
+
+Use the execute_sql tool to run this query."""
 
                 server_result = await llm.generate_str(server_prompt)
                 self.logger.info(f"✅ Server addition result: {server_result}")
 
-                # Step 3: Verify the server was added
-                verify_prompt = f"""Execute this SQL to verify the server was added:
-
-                Project ID: {self.supabase_project_id}
-
+                # Step 4: Verify the server was added
+                verify_query = f"""
                 SELECT id, server_name, display_name, transport, url, command
                 FROM mcp_servers 
                 WHERE server_name = '{server_name}'
                 ORDER BY created_at DESC 
                 LIMIT 1;
+                """
 
-                Use the execute_sql tool to run this query."""
+                self.logger.info(f"🔍 Verifying server '{server_name}' was added...")
+
+                verify_prompt = f"""Execute this SQL query to verify the server was added:
+
+Project ID: {self.supabase_project_id}
+Query: {verify_query}
+
+Use the execute_sql tool to run this query and show the results."""
 
                 verify_result = await llm.generate_str(verify_prompt)
                 self.logger.info(f"🔍 Verification result: {verify_result}")
@@ -4319,7 +4185,7 @@ The server is now available for use! You can reference it in future requests.
                     return {
                         "success": True,
                         "server_id": "added_successfully",
-                        "message": f"✅ Server '{server_name}' added to database successfully via MCP",
+                        "message": f"✅ Server '{server_name}' added to database successfully",
                         "details": verify_result,
                     }
                 else:
