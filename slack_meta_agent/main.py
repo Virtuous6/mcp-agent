@@ -12,11 +12,6 @@ from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
 from mcp_agent.human_input.handler import console_input_callback
 from rich import print
-from mcp_agent.workflows.intent_classifier.intent_classifier_base import Intent
-from mcp_agent.workflows.intent_classifier.intent_classifier_llm_openai import (
-    OpenAILLMIntentClassifier,
-)
-from mcp_agent.workflows.router.router_llm_openai import OpenAILLMRouter
 
 # Slack integration imports
 try:
@@ -100,131 +95,134 @@ class SlackMetaAgent:
         self.logger = logging.getLogger("SlackMetaAgent")
         self.event_loop = None
 
-        # Initialize structured intent classification system
-        self.intents = self._initialize_intent_system()
-        self.intent_classifier: Optional[OpenAILLMIntentClassifier] = None
-        self.router: Optional[OpenAILLMRouter] = None
+        # Dynamic tool discovery cache
+        self.discovered_tools: Optional[Dict[str, Dict]] = None
+        self.tools_cache_timestamp: Optional[datetime] = None
+        self.cache_ttl_seconds = 300  # 5-minute cache TTL
 
-    def _initialize_intent_system(self):
-        """Initialize structured intent classification system based on proven patterns"""
-        return [
-            Intent(
-                name="capability_inquiry",
-                description="Questions about the bot's capabilities, available tools, or what it can do",
-                examples=[
-                    "what tools do you have access to",
-                    "what can you do",
-                    "what are your capabilities",
-                    "list your available functions",
-                    "what MCP servers are connected",
-                    "show me what you can help with",
-                    "what APIs do you have access to",
-                    "what integrations are available",
-                ],
-                metadata={
-                    "agent_type": "capability_inspector",
-                    "servers": "",  # This agent will introspect across all other agents
-                    "priority": "high",
-                },
-            ),
-            Intent(
-                name="real_time_data",
-                description="Requests for current, real-time, or frequently changing information",
-                examples=[
-                    "what is the weather in austin texas",
-                    "current stock price of Apple",
-                    "latest news about Tesla",
-                    "today's sports scores",
-                    "current temperature in New York",
-                    "recent market trends",
-                    "live cryptocurrency prices",
-                ],
-                metadata={
-                    "agent_type": "data_researcher",
-                    "servers": "brave_search,fetch",
-                    "priority": "medium",
-                },
-            ),
-            Intent(
-                name="factual_knowledge",
-                description="Basic factual questions that can be answered from training data",
-                examples=[
-                    "what is the capital of France",
-                    "who was the first president",
-                    "what does artificial intelligence mean",
-                    "explain photosynthesis",
-                    "what is the speed of light",
-                    "when did World War 2 end",
-                ],
-                metadata={
-                    "agent_type": "knowledge_agent",
-                    "servers": "",
-                    "priority": "low",
-                },
-            ),
-            Intent(
-                name="financial_analysis",
-                description="Financial analysis, reporting, dashboard creation, or investment research",
-                examples=[
-                    "create Q4 revenue dashboard",
-                    "analyze Apple's financial performance",
-                    "compare SaaS metrics",
-                    "build financial model for startup",
-                    "research market trends for tech stocks",
-                ],
-                metadata={
-                    "agent_type": "financial_analyst",
-                    "servers": "supabase,brave_search,fetch",
-                    "priority": "high",
-                },
-            ),
-            Intent(
-                name="code_development",
-                description="Software development, deployment, or technical implementation",
-                examples=[
-                    "deploy this app to production",
-                    "create a React dashboard",
-                    "fix this bug in the code",
-                    "write unit tests",
-                    "setup CI/CD pipeline",
-                ],
-                metadata={
-                    "agent_type": "code_developer",
-                    "servers": "github,filesystem,fetch",
-                    "priority": "high",
-                },
-            ),
-            Intent(
-                name="research_analysis",
-                description="Research, data gathering, and comprehensive analysis tasks",
-                examples=[
-                    "research best practices for SaaS onboarding",
-                    "analyze competitor landscape",
-                    "gather data on market size",
-                    "research industry benchmarks",
-                ],
-                metadata={
-                    "agent_type": "data_researcher",
-                    "servers": "brave_search,fetch,supabase",
-                    "priority": "medium",
-                },
-            ),
-            Intent(
-                name="project_management",
-                description="Project coordination, planning, and team management",
-                examples=[
-                    "create project timeline",
-                    "coordinate team meeting",
-                    "track progress on deliverables",
-                    "manage project resources",
-                ],
-                metadata={
-                    "agent_type": "project_manager",
-                    "servers": "slack,github,supabase",
-                    "priority": "medium",
-                },
-            ),
-        ]
+    async def _discover_available_tools(self) -> Dict[str, Dict]:
+        """Dynamically discover all available tools from connected MCP servers"""
+        self.logger.info("🔍 Discovering available tools from MCP servers...")
+        discovered_tools = {}
+
+        for agent_type, spec in self.agent_registry.items():
+            if not spec.server_names:
+                # Agents without servers (like knowledge_agent) - just use their capabilities
+                discovered_tools[agent_type] = {
+                    "agent_description": spec.instruction[:200] + "...",
+                    "servers": [],
+                    "tools": [],
+                    "capabilities": spec.capabilities,
+                }
+                continue
+
+            agent_tools = {}
+            for server_name in spec.server_names:
+                try:
+                    # Create temporary agent to discover tools
+                    temp_agent = Agent(
+                        name=f"discovery_{server_name}",
+                        instruction="Tool discovery agent",
+                        server_names=[server_name],
+                    )
+
+                    async with temp_agent:
+                        tools_result = await temp_agent.list_tools(server_name)
+                        capabilities = await temp_agent.get_capabilities(server_name)
+
+                        agent_tools[server_name] = {
+                            "tools": [
+                                {
+                                    "name": tool.name,
+                                    "description": tool.description
+                                    or "No description available",
+                                    "parameters": getattr(tool, "inputSchema", {}),
+                                }
+                                for tool in tools_result.tools
+                            ]
+                            if tools_result
+                            else [],
+                            "capabilities": capabilities.model_dump()
+                            if capabilities
+                            else {},
+                        }
+
+                        self.logger.info(
+                            f"✅ Discovered {len(agent_tools[server_name]['tools'])} tools from {server_name}"
+                        )
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"⚠️  Could not discover tools for {server_name}: {e}"
+                    )
+                    agent_tools[server_name] = {
+                        "tools": [],
+                        "capabilities": {},
+                        "error": str(e),
+                    }
+
+            discovered_tools[agent_type] = {
+                "agent_description": spec.instruction[:200] + "...",
+                "servers": spec.server_names,
+                "server_tools": agent_tools,
+                "capabilities": spec.capabilities,
+            }
+
+        self.logger.info(
+            f"🎯 Tool discovery complete: {len(discovered_tools)} agent types analyzed"
+        )
+        return discovered_tools
+
+    async def _get_cached_tools(self) -> Dict[str, Dict]:
+        """Get cached tool discovery with TTL"""
+        now = datetime.now()
+
+        # Check if cache is valid
+        if (
+            self.discovered_tools is not None
+            and self.tools_cache_timestamp is not None
+            and (now - self.tools_cache_timestamp).total_seconds()
+            < self.cache_ttl_seconds
+        ):
+            self.logger.debug("🔄 Using cached tool discovery")
+            return self.discovered_tools
+
+        # Cache is stale or doesn't exist, refresh
+        self.logger.info("🔄 Refreshing tool discovery cache")
+        self.discovered_tools = await self._discover_available_tools()
+        self.tools_cache_timestamp = now
+        return self.discovered_tools
+
+    def _format_agent_capabilities(self, tools: Dict[str, Dict]) -> str:
+        """Format agent capabilities for the routing prompt"""
+        formatted = []
+
+        for agent_type, info in tools.items():
+            formatted.append(f"\n**{agent_type.upper()}**:")
+            formatted.append(f"  Purpose: {info['agent_description']}")
+
+            if info.get("servers"):
+                formatted.append(f"  MCP Servers: {', '.join(info['servers'])}")
+
+                # Show key tools for each server
+                server_tools = info.get("server_tools", {})
+                for server_name, server_info in server_tools.items():
+                    tools_list = server_info.get("tools", [])
+                    if tools_list:
+                        tool_names = [f"`{t['name']}`" for t in tools_list[:3]]
+                        if len(tools_list) > 3:
+                            tool_names.append(f"+ {len(tools_list) - 3} more")
+                        formatted.append(
+                            f"    - {server_name}: {', '.join(tool_names)}"
+                        )
+                    elif "error" in server_info:
+                        formatted.append(f"    - {server_name}: (connection issue)")
+            else:
+                formatted.append(
+                    f"  Built-in capabilities: {', '.join(info.get('capabilities', []))}"
+                )
+
+        return "\n".join(formatted)
 
     def _initialize_agent_registry(self) -> Dict[str, AgentSpec]:
         """Initialize the registry of available specialized agents"""
@@ -291,19 +289,17 @@ class SlackMetaAgent:
             ),
             "code_developer": AgentSpec(
                 name="code_developer",
-                instruction="""You are a software developer with access to GitHub, filesystem, 
-                and development tools. You can write code, deploy applications, manage repositories, 
-                and create technical solutions.
+                instruction="""You are a software developer with access to filesystem and development tools. 
+                You can write code, create applications, and provide technical solutions.
                 
-                For dashboard deployment, you should:
+                For dashboard development, you should:
                 1. Create responsive dashboard code (React/Next.js preferred)
-                2. Deploy to GitHub repository or hosting platform
+                2. Provide deployment instructions
                 3. Ensure mobile-friendly and accessible design
-                4. Return the live dashboard URL""",
-                server_names=["github", "filesystem", "fetch"],
+                4. Generate complete code solutions""",
+                server_names=["filesystem", "fetch"],
                 capabilities=[
                     "code_generation",
-                    "deployment",
                     "testing",
                     "documentation",
                 ],
@@ -324,23 +320,70 @@ class SlackMetaAgent:
             ),
             "project_manager": AgentSpec(
                 name="project_manager",
-                instruction="""You are a project management expert with access to collaboration 
-                tools and databases. You can create project plans, track progress, coordinate 
-                teams, and manage workflows.""",
-                server_names=["supabase", "slack", "github"],
+                instruction="""You are a project management expert with access to databases 
+                and coordination tools. You can create project plans, track progress, 
+                and manage workflows using available data sources.""",
+                server_names=["supabase", "fetch"],
                 capabilities=[
                     "project_planning",
-                    "team_coordination",
                     "progress_tracking",
+                    "data_management",
                 ],
             ),
             "communication_specialist": AgentSpec(
                 name="communication_specialist",
-                instruction="""You are a communication expert with access to Slack, email, 
-                and content creation tools. You can draft messages, create presentations, 
-                manage communications, and facilitate collaboration.""",
-                server_names=["slack", "fetch", "supabase"],
+                instruction="""You are a communication expert with access to content creation tools. 
+                You can draft messages, create presentations, manage content, and facilitate communication 
+                through available channels.""",
+                server_names=["fetch", "supabase"],
                 capabilities=["content_creation", "communication", "presentation"],
+            ),
+            "automation_specialist": AgentSpec(
+                name="automation_specialist",
+                instruction="""You are a workflow automation expert with access to n8n workflows and Airtable. 
+                You can trigger automated workflows, sync data between systems, and manage complex automation processes.
+                
+                When handling automation requests, you should:
+                1. Identify the appropriate n8n workflow to trigger
+                2. Gather required data from the user or other systems
+                3. Execute the workflow with proper parameters
+                4. Monitor the automation and provide status updates
+                5. Handle any errors or exceptions gracefully
+                
+                You specialize in:
+                - Triggering n8n workflows via webhook URLs
+                - Managing Airtable record operations
+                - Data synchronization between platforms
+                - Automated data processing workflows""",
+                server_names=["n8n", "supabase", "fetch"],
+                capabilities=[
+                    "workflow_automation",
+                    "data_synchronization",
+                    "process_automation",
+                    "airtable_integration",
+                ],
+            ),
+            "airtable_manager": AgentSpec(
+                name="airtable_manager",
+                instruction="""You are an Airtable database specialist with expertise in managing 
+                records, organizing data, and performing database operations through n8n workflows.
+                
+                You can:
+                1. Create, read, update, and delete Airtable records
+                2. Query and filter Airtable data
+                3. Manage table relationships and data structure
+                4. Perform bulk operations on records
+                5. Generate reports from Airtable data
+                
+                Always ensure data integrity and follow best practices for database operations.
+                Use n8n workflows to interact with Airtable for complex operations.""",
+                server_names=["n8n", "fetch"],
+                capabilities=[
+                    "airtable_operations",
+                    "database_management",
+                    "record_management",
+                    "data_querying",
+                ],
             ),
         }
 
@@ -464,7 +507,7 @@ class SlackMetaAgent:
                 # Store conversation memory (legacy support)
                 await self._store_conversation_memory(user_id, message_text, channel_id)
 
-                # Enhanced intent analysis with context
+                # Dynamic intent analysis with context
                 context = {
                     "user_id": user_id,
                     "channel_id": channel_id,
@@ -472,7 +515,7 @@ class SlackMetaAgent:
                     "turn_number": conversation_state.current_turn + 1,
                 }
 
-                intent_analysis = await self._analyze_user_intent_structured(
+                intent_analysis = await self._analyze_user_intent_dynamic(
                     message_text, context
                 )
 
@@ -589,92 +632,119 @@ class SlackMetaAgent:
         self.specialized_agents[agent_type] = agent
         return agent
 
-    async def _initialize_intent_classifier(self):
-        """Initialize the intent classifier and router with the structured system"""
-        if self.intent_classifier is None:
-            # Create the intent classifier
-            self.intent_classifier = OpenAILLMIntentClassifier(
-                intents=self.intents, name="slack_intent_classifier"
-            )
-            await self.intent_classifier.initialize()
-
-            # Create router for agent selection
-            available_agents = [
-                await self.create_specialized_agent(agent_type)
-                for agent_type in self.agent_registry.keys()
-            ]
-
-            self.router = OpenAILLMRouter(
-                agents=available_agents, name="slack_agent_router"
-            )
-
-            self.logger.info("✅ Intent classifier and router initialized")
-
-    async def _analyze_user_intent_structured(
+    async def _analyze_user_intent_dynamic(
         self, message: str, context: Dict = None
     ) -> Dict:
-        """Modern intent analysis using structured IntentClassifier - replaces old method"""
+        """Dynamic intent analysis using actual tool discovery - replaces hard-coded patterns"""
         try:
-            # Initialize classifier if needed
-            if self.intent_classifier is None:
-                await self._initialize_intent_classifier()
+            # Get fresh tool discovery (with caching)
+            tools = await self._get_cached_tools()
 
-            # Classify the user's intent
-            intent_results = await self.intent_classifier.classify(message, top_k=2)
+            # Create routing prompt with actual available tools
+            routing_prompt = f"""
+            User request: "{message}"
+            
+            Available specialized agents and their actual tools:
+            {self._format_agent_capabilities(tools)}
+            
+            Context: {context.get("recent_context", "First interaction") if context else "No context"}
+            
+            Analyze this request and determine:
+            1. Which agent type is BEST suited for this request
+            2. What complexity level (simple/moderate/complex) 
+            3. What execution strategy (single_agent/orchestrated)
+            4. Confidence level (high/medium/low)
+            
+            Return a JSON response with:
+            {{
+                "selected_agent": "agent_type_name",
+                "reasoning": "explanation of why this agent was selected",
+                "complexity": "simple|moderate|complex",
+                "execution_strategy": "single_agent|orchestrated",
+                "confidence": "high|medium|low",
+                "estimated_tasks": number,
+                "requires_tools": ["tool1", "tool2"]
+            }}
+            
+            Important: 
+            - For capability questions, use "capability_inspector"
+            - For factual questions (not requiring real-time data), use "knowledge_agent"
+            - For weather/current events/real-time data, use "data_researcher"
+            - For airtable/n8n/automation, use "automation_specialist" or "airtable_manager"
+            - Match the user's request to the actual tools available
+            """
 
-            if not intent_results:
-                # Fallback to default
-                return {
-                    "required_agents": ["data_researcher"],
-                    "complexity": "simple",
-                    "estimated_tasks": 1,
-                    "execution_strategy": "single_agent",
-                    "priority": "medium",
-                    "task_description": "General request",
-                    "reasoning": "No intent match - using fallback",
-                    "intent_name": "unknown",
-                    "confidence": "low",
+            # Use OpenAI to analyze the request dynamically
+            from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+
+            # Create a temporary agent to use OpenAI for routing
+            routing_agent = Agent(
+                name="dynamic_router",
+                instruction="You are a routing agent that analyzes user requests and selects the best specialized agent.",
+                server_names=[],  # No MCP servers needed for routing
+            )
+
+            async with routing_agent:
+                llm = await routing_agent.attach_llm(OpenAIAugmentedLLM)
+                routing_result = await llm.generate_str(routing_prompt)
+
+                # Parse the JSON response
+                import json
+
+                try:
+                    parsed_result = json.loads(routing_result)
+                except json.JSONDecodeError:
+                    # Extract JSON from the response if it's wrapped in text
+                    import re
+
+                    json_match = re.search(r"\{.*\}", routing_result, re.DOTALL)
+                    if json_match:
+                        parsed_result = json.loads(json_match.group())
+                    else:
+                        raise ValueError("Could not parse routing response")
+
+                        # Validate and format the response
+                selected_agent = parsed_result.get("selected_agent", "data_researcher")
+
+                # Normalize agent name (case-insensitive matching)
+                selected_agent_lower = selected_agent.lower()
+                if selected_agent_lower in self.agent_registry:
+                    selected_agent = selected_agent_lower
+                elif selected_agent not in self.agent_registry:
+                    self.logger.warning(
+                        f"Unknown agent {selected_agent}, defaulting to data_researcher"
+                    )
+                    selected_agent = "data_researcher"
+
+                analysis = {
+                    "required_agents": [selected_agent],
+                    "complexity": parsed_result.get("complexity", "simple"),
+                    "estimated_tasks": parsed_result.get("estimated_tasks", 1),
+                    "execution_strategy": parsed_result.get(
+                        "execution_strategy", "single_agent"
+                    ),
+                    "priority": "high"
+                    if parsed_result.get("confidence") == "high"
+                    else "medium",
+                    "task_description": f"Dynamic routing to {selected_agent}",
+                    "reasoning": parsed_result.get(
+                        "reasoning", "Dynamic tool-based routing"
+                    ),
+                    "intent_name": f"dynamic_{selected_agent}",
+                    "confidence": parsed_result.get("confidence", "medium"),
+                    "requires_tools": parsed_result.get("requires_tools", []),
                 }
 
-            # Get the best intent match
-            best_intent = intent_results[0]
-            intent_obj = next(i for i in self.intents if i.name == best_intent.intent)
-
-            # Extract agent type from metadata
-            agent_type = intent_obj.metadata.get("agent_type", "data_researcher")
-            priority = intent_obj.metadata.get("priority", "medium")
-
-            # Determine execution strategy based on intent and complexity
-            execution_strategy = "single_agent"
-            estimated_tasks = 1
-            complexity = "simple"
-
-            # Multi-agent strategies for complex intents
-            if best_intent.intent in ["financial_analysis", "code_development"]:
-                execution_strategy = "orchestrated"
-                estimated_tasks = 3
-                complexity = "moderate"
-
-            analysis = {
-                "required_agents": [agent_type],
-                "complexity": complexity,
-                "estimated_tasks": estimated_tasks,
-                "execution_strategy": execution_strategy,
-                "priority": priority,
-                "task_description": intent_obj.description,
-                "reasoning": f"Intent classifier matched '{best_intent.intent}' with confidence {getattr(best_intent, 'confidence', 'unknown')}",
-                "intent_name": best_intent.intent,
-                "confidence": getattr(best_intent, "confidence", "medium"),
-                "all_intents": [r.intent for r in intent_results],  # For debugging
-            }
-
-            self.logger.info(
-                f"🎯 Structured intent analysis: {best_intent.intent} -> {agent_type}"
-            )
-            return analysis
+                self.logger.info(
+                    f"🎯 Dynamic routing: {message[:50]}... -> {selected_agent} (confidence: {analysis['confidence']})"
+                )
+                return analysis
 
         except Exception as e:
-            self.logger.error(f"Intent classification error: {e}")
+            self.logger.error(f"Dynamic routing error: {e}")
+            import traceback
+
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             # Fallback to simple logic
             return await self._analyze_user_intent_fallback(message, context)
 
@@ -1347,136 +1417,111 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
             # Fallback to basic response
             await self._send_slack_response(channel_id, result, analysis, thread_ts)
 
-    async def test_intent_routing_enhanced(self):
-        """Enhanced test that verifies the new structured intent classification system"""
+    async def test_dynamic_routing(self):
+        """Test the new dynamic routing system that uses actual tool discovery"""
         test_cases = [
             {
                 "message": "what tools do you have access to?",
-                "expected_intent": "capability_inquiry",
                 "expected_agent": "capability_inspector",
                 "description": "Capability inquiry",
             },
             {
                 "message": "what is the weather in austin, texas?",
-                "expected_intent": "real_time_data",
                 "expected_agent": "data_researcher",
                 "description": "Weather query (real-time data)",
             },
             {
                 "message": "what is the capital of France?",
-                "expected_intent": "factual_knowledge",
                 "expected_agent": "knowledge_agent",
                 "description": "Basic factual question",
             },
             {
                 "message": "create Q4 revenue dashboard for our SaaS metrics",
-                "expected_intent": "financial_analysis",
                 "expected_agent": "financial_analyst",
                 "description": "Financial dashboard request",
             },
             {
-                "message": "current stock price of Apple",
-                "expected_intent": "real_time_data",
-                "expected_agent": "data_researcher",
-                "description": "Real-time financial data",
+                "message": "use the airtable mcp to connect to this base id",
+                "expected_agent": "airtable_manager",
+                "description": "Airtable MCP connection request",
             },
             {
-                "message": "deploy this React app to production",
-                "expected_intent": "code_development",
-                "expected_agent": "code_developer",
-                "description": "Code deployment request",
-            },
-            {
-                "message": "what can you do for me?",
-                "expected_intent": "capability_inquiry",
-                "expected_agent": "capability_inspector",
-                "description": "General capability question",
+                "message": "trigger n8n workflow to update airtable",
+                "expected_agent": "automation_specialist",
+                "description": "n8n workflow automation",
             },
         ]
 
         results = []
         for test_case in test_cases:
             try:
-                analysis = await self._analyze_user_intent_structured(
-                    test_case["message"]
-                )
+                analysis = await self._analyze_user_intent_dynamic(test_case["message"])
                 actual_agent = analysis.get("required_agents", [None])[0]
-                actual_intent = analysis.get("intent_name", "unknown")
+                confidence = analysis.get("confidence", "unknown")
+                reasoning = analysis.get("reasoning", "")
 
                 agent_success = actual_agent == test_case["expected_agent"]
-                intent_success = actual_intent == test_case["expected_intent"]
-                overall_success = agent_success and intent_success
 
                 result = {
                     "message": test_case["message"],
                     "description": test_case["description"],
-                    "expected_intent": test_case["expected_intent"],
-                    "actual_intent": actual_intent,
                     "expected_agent": test_case["expected_agent"],
                     "actual_agent": actual_agent,
-                    "intent_success": intent_success,
-                    "agent_success": agent_success,
-                    "overall_success": overall_success,
-                    "confidence": analysis.get("confidence", "unknown"),
-                    "reasoning": analysis.get("reasoning", ""),
+                    "success": agent_success,
+                    "confidence": confidence,
+                    "reasoning": reasoning,
                 }
                 results.append(result)
 
-                status = "✅" if overall_success else "❌"
+                status = "✅" if agent_success else "❌"
                 self.logger.info(
-                    f"{status} {test_case['description']}: '{test_case['message']}' -> Intent: {actual_intent} ({test_case['expected_intent']}) | Agent: {actual_agent} ({test_case['expected_agent']})"
+                    f"{status} {test_case['description']}: '{test_case['message']}' -> {actual_agent} (expected: {test_case['expected_agent']}) | Confidence: {confidence}"
                 )
 
             except Exception as e:
                 self.logger.error(
-                    f"❌ Enhanced test failed for '{test_case['message']}': {e}"
+                    f"❌ Dynamic routing test failed for '{test_case['message']}': {e}"
                 )
                 results.append(
                     {
                         "message": test_case["message"],
                         "description": test_case["description"],
-                        "expected_intent": test_case["expected_intent"],
                         "expected_agent": test_case["expected_agent"],
-                        "actual_intent": "ERROR",
                         "actual_agent": "ERROR",
-                        "overall_success": False,
+                        "success": False,
                         "error": str(e),
                     }
                 )
 
-        # Enhanced summary
-        successful = sum(1 for r in results if r.get("overall_success", False))
-        intent_matches = sum(1 for r in results if r.get("intent_success", False))
-        agent_matches = sum(1 for r in results if r.get("agent_success", False))
+        # Summary
+        successful = sum(1 for r in results if r.get("success", False))
         total = len(results)
 
-        self.logger.info("🧪 Enhanced intent routing test results:")
+        self.logger.info("🧪 Dynamic routing test results:")
         self.logger.info(
-            f"   Overall: {successful}/{total} passed ({successful / total * 100:.1f}%)"
+            f"   Success rate: {successful}/{total} ({successful / total * 100:.1f}%)"
         )
-        self.logger.info(f"   Intent classification: {intent_matches}/{total} correct")
-        self.logger.info(f"   Agent routing: {agent_matches}/{total} correct")
 
-        # Check if weather routing is fixed and overall system performance
+        # Check specific test cases
         weather_test = next((r for r in results if "weather" in r["message"]), None)
-        if weather_test and weather_test["overall_success"]:
+        if weather_test and weather_test["success"]:
             self.logger.info(
-                f"✅ Weather routing fix confirmed - weather questions now correctly classified as '{weather_test['actual_intent']}' -> {weather_test['actual_agent']}!"
-            )
-        elif weather_test and not weather_test["overall_success"]:
-            self.logger.warning(
-                f"⚠️  Weather routing still incorrect: Intent: {weather_test['actual_intent']} vs {weather_test['expected_intent']}, Agent: {weather_test['actual_agent']} vs {weather_test['expected_agent']}"
+                f"✅ Weather routing working: {weather_test['actual_agent']} selected"
             )
 
-        # Overall system assessment
-        successful_tests = sum(1 for r in results if r.get("overall_success", False))
-        if successful_tests >= len(results) * 0.8:  # 80% success rate
+        airtable_test = next(
+            (r for r in results if "airtable mcp" in r["message"]), None
+        )
+        if airtable_test and airtable_test["success"]:
             self.logger.info(
-                "🎉 Enhanced intent classification system is working excellently!"
+                f"✅ Airtable MCP routing working: {airtable_test['actual_agent']} selected"
             )
+
+        if successful >= total * 0.8:  # 80% success rate
+            self.logger.info("🎉 Dynamic routing system is working excellently!")
         else:
             self.logger.warning(
-                f"⚠️  Intent system needs tuning: {successful_tests}/{len(results)} tests passed"
+                f"⚠️  Dynamic routing needs tuning: {successful}/{total} tests passed"
             )
 
         return results
@@ -1547,34 +1592,23 @@ async def main():
             else:
                 logger.info("💡 Skipping database test (set TEST_DB=true to enable)")
 
-            # Test intent routing to verify agent selection works correctly
-            logger.info("🧪 Testing enhanced intent routing system...")
-            enhanced_test_results = await meta_agent.test_intent_routing_enhanced()
+            # Test dynamic routing to verify the new tool-discovery system works
+            logger.info("🧪 Testing dynamic routing system...")
+            routing_test_results = await meta_agent.test_dynamic_routing()
 
-            # Check if weather routing is fixed and overall system performance
-            weather_test = next(
-                (r for r in enhanced_test_results if "weather" in r["message"]), None
-            )
-            if weather_test and weather_test["overall_success"]:
-                logger.info(
-                    f"✅ Weather routing fix confirmed - weather questions now correctly classified as '{weather_test['actual_intent']}' -> {weather_test['actual_agent']}!"
-                )
-            elif weather_test and not weather_test["overall_success"]:
-                logger.warning(
-                    f"⚠️  Weather routing still incorrect: Intent: {weather_test['actual_intent']} vs {weather_test['expected_intent']}, Agent: {weather_test['actual_agent']} vs {weather_test['expected_agent']}"
-                )
-
-            # Overall system assessment
+            # Show key results
             successful_tests = sum(
-                1 for r in enhanced_test_results if r.get("overall_success", False)
+                1 for r in routing_test_results if r.get("success", False)
             )
-            if successful_tests >= len(enhanced_test_results) * 0.8:  # 80% success rate
+            total_tests = len(routing_test_results)
+
+            if successful_tests >= total_tests * 0.8:  # 80% success rate
                 logger.info(
-                    "🎉 Enhanced intent classification system is working excellently!"
+                    f"🎉 Dynamic routing system working excellently! ({successful_tests}/{total_tests} passed)"
                 )
             else:
                 logger.warning(
-                    f"⚠️  Intent system needs tuning: {successful_tests}/{len(enhanced_test_results)} tests passed"
+                    f"⚠️  Dynamic routing needs improvement: {successful_tests}/{total_tests} tests passed"
                 )
 
             # Start the WebSocket connection

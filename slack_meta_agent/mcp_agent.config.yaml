@@ -13,10 +13,8 @@ logger:
 
 mcp:
   servers:
-    # Core Slack integration
-    slack:
-      command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-slack"]
+    # Note: Slack integration is handled directly via Socket Mode in main.py
+    # No MCP server needed since we have direct Slack WebSocket connection
 
     # Supabase for data persistence, memory, and workflows
     supabase:
@@ -27,29 +25,35 @@ mcp:
     # Essential utility servers
     filesystem:
       command: "npx"
-      args: ["-y", "@modelcontextprotocol/server-filesystem"]
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 
     fetch:
       command: "uvx"
       args: ["mcp-server-fetch"]
 
-    # GitHub for code deployment and management
-    github:
-      command: "docker"
-      args:
-        [
-          "run",
-          "-i",
-          "--rm",
-          "-e",
-          "GITHUB_PERSONAL_ACCESS_TOKEN",
-          "ghcr.io/github/github-mcp-server",
-        ]
+    # GitHub for code deployment and management (commented out - add your GitHub token to enable)
+    # github:
+    #   command: "docker"
+    #   args:
+    #     [
+    #       "run",
+    #       "-i",
+    #       "--rm",
+    #       "-e",
+    #       "GITHUB_PERSONAL_ACCESS_TOKEN",
+    #       "ghcr.io/github/github-mcp-server",
+    #     ]
 
     # Browser automation for complex workflows
     brave_search:
       command: "npx"
       args: ["-y", "@modelcontextprotocol/server-brave-search"]
+
+    # n8n automation and workflow server via MCP endpoint
+    n8n:
+      transport: "sse"
+      url: "https://advertisingreportcard.app.n8n.cloud/mcp/gmail-enhanced/sse"
+      description: "n8n workflow automation with Airtable integration"
 
 openai:
   default_model: gpt-4o
