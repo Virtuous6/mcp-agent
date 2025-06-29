@@ -8,11 +8,13 @@
       "temp",
       "rain",
       "sunny",
-      "cloudy"
+      "cloudy",
+      "what",
+      "from"
     ],
     "agent": "data_researcher",
-    "confidence": 0.91,
-    "usage_count": 1
+    "confidence": 0.9400000000000001,
+    "usage_count": 6
   },
   "knowledge": {
     "keywords": [

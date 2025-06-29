@@ -16,10 +16,14 @@ from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
 from mcp_agent.human_input.handler import console_input_callback
+from mcp_agent.human_input.types import HumanInputRequest
 from rich import print
 
 # Import our custom Supabase logging
 from supabase_logger import setup_supabase_logging
+
+# Import database configuration system
+from supabase_config_loader import get_settings_from_database, DatabaseConfig
 
 # Slack integration imports
 try:
@@ -33,7 +37,8 @@ except ImportError:
     print("⚠️  Slack SDK not installed. Install with: pip install slack-sdk")
     SLACK_AVAILABLE = False
 
-app = MCPApp(name="slack_meta_agent", human_input_callback=console_input_callback)
+# Note: MCPApp will be created in main() with database configuration
+app = None
 
 
 @dataclass
@@ -88,7 +93,7 @@ class ConversationState:
 class SlackMetaAgent:
     """The main meta-agent that orchestrates all other agents and handles Slack interactions"""
 
-    def __init__(self, supabase_project_id: str = None):
+    def __init__(self, supabase_project_id: str = None, mcp_app=None):
         self.specialized_agents: Dict[str, Agent] = {}
         self.agent_registry: Dict[str, AgentSpec] = self._initialize_agent_registry()
         self.conversation_memory: Dict[
@@ -105,11 +110,22 @@ class SlackMetaAgent:
         self.supabase_project_id = supabase_project_id
         self.session_id = None
         self.supabase_log_handler = None
+        self.mcp_app = (
+            mcp_app  # Store MCPApp instance for proper server registry access
+        )
 
         # Dynamic tool discovery cache
         self.discovered_tools: Optional[Dict[str, Dict]] = None
         self.tools_cache_timestamp: Optional[datetime] = None
         # Cache TTL now dynamic - managed in self.config
+
+        # Human input handling for Slack
+        self.pending_human_inputs: Dict[
+            str, asyncio.Future
+        ] = {}  # user_id -> Future[str]
+        self.current_thread_ts: Optional[str] = (
+            None  # Track current thread for human input
+        )
 
         # Simplified connection pool with state isolation
         self.agent_pool: Dict[str, Agent] = {}
@@ -268,85 +284,101 @@ class SlackMetaAgent:
 
         discovered_tools = {}
 
-        for agent_type, spec in self.agent_registry.items():
-            if not spec.server_names:
-                # Agents without servers (like knowledge_agent) - just use their capabilities
-                discovered_tools[agent_type] = {
-                    "agent_description": spec.instruction[:200] + "...",
-                    "servers": [],
-                    "tools": [],
-                    "capabilities": spec.capabilities,
-                }
-                continue
+        # Use MCPApp if available, otherwise fall back to temporary agents
+        if self.mcp_app:
+            self.logger.info("✅ Using MCPApp context for tool discovery")
 
-            agent_tools = {}
-            for server_name in spec.server_names:
-                try:
-                    # Create temporary agent to discover tools with timeout
-                    temp_agent = Agent(
-                        name=f"discovery_{server_name}",
-                        instruction="Tool discovery agent",
-                        server_names=[server_name],
-                    )
+            for agent_type, spec in self.agent_registry.items():
+                if not spec.server_names:
+                    # Agents without servers (like knowledge_agent) - just use their capabilities
+                    discovered_tools[agent_type] = {
+                        "agent_description": spec.instruction[:200] + "...",
+                        "servers": [],
+                        "tools": [],
+                        "capabilities": spec.capabilities,
+                    }
+                    continue
 
-                    async with temp_agent:
-                        # Add timeout for individual server discovery
-                        tools_result = await asyncio.wait_for(
-                            temp_agent.list_tools(server_name), timeout=10.0
-                        )
-                        capabilities = await asyncio.wait_for(
-                            temp_agent.get_capabilities(server_name), timeout=5.0
+                agent_tools = {}
+                for server_name in spec.server_names:
+                    try:
+                        # Create agent with MCPApp context for proper server registry access
+                        temp_agent = Agent(
+                            name=f"discovery_{server_name}",
+                            instruction="Tool discovery agent",
+                            server_names=[server_name],
+                            context=self.mcp_app.context,  # Pass MCPApp context
                         )
 
-                        agent_tools[server_name] = {
-                            "tools": [
-                                {
-                                    "name": tool.name,
-                                    "description": tool.description
-                                    or "No description available",
-                                    "parameters": getattr(tool, "inputSchema", {}),
-                                }
-                                for tool in tools_result.tools
-                            ]
-                            if tools_result
-                            else [],
-                            "capabilities": capabilities.model_dump()
-                            if capabilities
-                            else {},
-                        }
-
-                        # Only log if significant number of tools discovered
-                        tool_count = len(agent_tools[server_name]["tools"])
-                        if tool_count > 5:  # Only log if meaningful discovery
-                            self.logger.info(
-                                f"✅ Discovered {tool_count} tools from {server_name}"
+                        async with temp_agent:
+                            # Add timeout for individual server discovery
+                            tools_result = await asyncio.wait_for(
+                                temp_agent.list_tools(server_name), timeout=10.0
+                            )
+                            capabilities = await asyncio.wait_for(
+                                temp_agent.get_capabilities(server_name), timeout=5.0
                             )
 
-                except asyncio.TimeoutError:
-                    self.logger.warning(
-                        f"⚠️  Tool discovery timed out for {server_name}"
-                    )
-                    agent_tools[server_name] = {
-                        "tools": [],
-                        "capabilities": {},
-                        "error": f"Timeout connecting to {server_name}",
-                    }
-                except Exception as e:
-                    self.logger.warning(
-                        f"⚠️  Could not discover tools for {server_name}: {e}"
-                    )
-                    agent_tools[server_name] = {
-                        "tools": [],
-                        "capabilities": {},
-                        "error": str(e),
-                    }
+                            agent_tools[server_name] = {
+                                "tools": [
+                                    {
+                                        "name": tool.name,
+                                        "description": tool.description
+                                        or "No description available",
+                                        "parameters": getattr(tool, "inputSchema", {}),
+                                    }
+                                    for tool in tools_result.tools
+                                ]
+                                if tools_result
+                                else [],
+                                "capabilities": capabilities.model_dump()
+                                if capabilities
+                                else {},
+                            }
 
-            discovered_tools[agent_type] = {
-                "agent_description": spec.instruction[:200] + "...",
-                "servers": spec.server_names,
-                "server_tools": agent_tools,
-                "capabilities": spec.capabilities,
-            }
+                            # Only log if significant number of tools discovered
+                            tool_count = len(agent_tools[server_name]["tools"])
+                            if tool_count > 5:  # Only log if meaningful discovery
+                                self.logger.info(
+                                    f"✅ Discovered {tool_count} tools from {server_name}"
+                                )
+
+                    except asyncio.TimeoutError:
+                        self.logger.warning(
+                            f"⚠️  Tool discovery timed out for {server_name}"
+                        )
+                        agent_tools[server_name] = {
+                            "tools": [],
+                            "capabilities": {},
+                            "error": f"Timeout connecting to {server_name}",
+                        }
+                    except Exception as e:
+                        self.logger.warning(
+                            f"⚠️  Could not discover tools for {server_name}: {e}"
+                        )
+                        agent_tools[server_name] = {
+                            "tools": [],
+                            "capabilities": {},
+                            "error": str(e),
+                        }
+
+                discovered_tools[agent_type] = {
+                    "agent_description": spec.instruction[:200] + "...",
+                    "servers": spec.server_names,
+                    "server_tools": agent_tools,
+                    "capabilities": spec.capabilities,
+                }
+        else:
+            # Fallback to old method if no MCPApp available
+            self.logger.warning("⚠️  No MCPApp context - using fallback tool discovery")
+            for agent_type, spec in self.agent_registry.items():
+                discovered_tools[agent_type] = {
+                    "agent_description": spec.instruction[:200] + "...",
+                    "servers": spec.server_names,
+                    "server_tools": {},
+                    "capabilities": spec.capabilities,
+                    "error": "No MCPApp context available",
+                }
 
         # Log discovery summary only
         total_servers = sum(
@@ -377,14 +409,27 @@ class SlackMetaAgent:
                     continue
 
                 spec = self.agent_registry[agent_type]
-                agent = Agent(
-                    name=f"pooled_{spec.name}",
-                    instruction=spec.instruction,
-                    server_names=spec.server_names,
-                )
 
-                # Initialize the agent with persistent connections
-                await agent.__aenter__()
+                if self.mcp_app:
+                    # Create agent with MCPApp context for proper server registry access
+                    agent = Agent(
+                        name=f"pooled_{spec.name}",
+                        instruction=spec.instruction,
+                        server_names=spec.server_names,
+                        context=self.mcp_app.context,  # Pass MCPApp context
+                    )
+                    # Initialize the agent with persistent connections
+                    await agent.__aenter__()
+                else:
+                    # Fallback to direct Agent creation
+                    agent = Agent(
+                        name=f"pooled_{spec.name}",
+                        instruction=spec.instruction,
+                        server_names=spec.server_names,
+                    )
+                    # Initialize the agent with persistent connections
+                    await agent.__aenter__()
+
                 self.agent_pool[agent_type] = agent
 
                 # Reduced logging verbosity during startup
@@ -436,14 +481,27 @@ class SlackMetaAgent:
 
         # Recreate the agent
         spec = self.agent_registry[agent_type]
-        new_agent = Agent(
-            name=f"pooled_{spec.name}_recovered",
-            instruction=spec.instruction,
-            server_names=spec.server_names,
-        )
 
-        # Initialize the new agent
-        await new_agent.__aenter__()
+        if self.mcp_app:
+            # Create agent with MCPApp context for proper server registry access
+            new_agent = Agent(
+                name=f"pooled_{spec.name}_recovered",
+                instruction=spec.instruction,
+                server_names=spec.server_names,
+                context=self.mcp_app.context,  # Pass MCPApp context
+            )
+            # Initialize the new agent
+            await new_agent.__aenter__()
+        else:
+            # Fallback to direct Agent creation
+            new_agent = Agent(
+                name=f"pooled_{spec.name}_recovered",
+                instruction=spec.instruction,
+                server_names=spec.server_names,
+            )
+            # Initialize the new agent
+            await new_agent.__aenter__()
+
         self.agent_pool[agent_type] = new_agent
         self.agent_last_health_check[agent_type] = datetime.now()
         self.logger.info(f"✅ Recovered pooled {agent_type} agent")
@@ -796,9 +854,35 @@ class SlackMetaAgent:
             channel_id = event.get("channel")
             message_text = event.get("text", "")
             message_ts = event.get("ts")  # Capture the original message timestamp
+            thread_ts = event.get("thread_ts")  # Check if this is a threaded reply
 
             if not user_id or not channel_id or not message_text:
                 return
+
+            # 🚨 PRIORITY: Check if this is a response to a pending human input request
+            if user_id in self.pending_human_inputs and thread_ts:
+                self.logger.info(
+                    f"📝 Received human input response from user {user_id}"
+                )
+                try:
+                    # Clean the message text (remove mentions, etc.)
+                    clean_text = self._clean_user_input(message_text)
+
+                    # Resolve the Future with the user's response
+                    future = self.pending_human_inputs[user_id]
+                    if not future.done():
+                        future.set_result(clean_text)
+                        self.logger.info(
+                            f"✅ Human input resolved: {clean_text[:50]}..."
+                        )
+
+                    # Clean up the pending request
+                    del self.pending_human_inputs[user_id]
+                    return  # Don't process this as a new request
+
+                except Exception as e:
+                    self.logger.error(f"Error processing human input response: {e}")
+                    # Continue processing as normal message if error
 
             # Check if this is an app mention or direct message to our bot
             if event.get("type") == "app_mention" or channel_id.startswith("D"):
@@ -810,6 +894,13 @@ class SlackMetaAgent:
                     )
 
                 conversation_state = self.conversation_states[conversation_key]
+
+                # 🎯 Track current context for human input callbacks
+                self.current_user_id = user_id
+                self.current_channel_id = channel_id
+                self.current_thread_ts = (
+                    message_ts  # Use message timestamp as thread starter
+                )
 
                 # Add eyes reaction immediately to show the bot received the message
                 try:
@@ -974,11 +1065,22 @@ class SlackMetaAgent:
         # If not in pool, create a new one (fallback)
         self.logger.info(f"🆕 Creating new {agent_type} agent (not in pool)")
         spec = self.agent_registry[agent_type]
-        agent = Agent(
-            name=f"temp_{spec.name}_{request_id}",
-            instruction=spec.instruction,
-            server_names=spec.server_names,
-        )
+
+        if self.mcp_app:
+            # Create agent with MCPApp context for proper server registry access
+            agent = Agent(
+                name=f"temp_{spec.name}_{request_id}",
+                instruction=spec.instruction,
+                server_names=spec.server_names,
+                context=self.mcp_app.context,  # Pass MCPApp context
+            )
+        else:
+            # Fallback to direct Agent creation
+            agent = Agent(
+                name=f"temp_{spec.name}_{request_id}",
+                instruction=spec.instruction,
+                server_names=spec.server_names,
+            )
 
         # Initialize isolated conversation context
         self._initialize_request_conversation(request_id, agent_type)
@@ -1106,7 +1208,37 @@ class SlackMetaAgent:
     ) -> Dict:
         """Dynamic intent analysis using actual tool discovery - replaces hard-coded patterns"""
         try:
-            # 🚀 Dynamic pattern matching first (bypass LLM for common requests)
+            # 🔍 FIRST: Check if we need dynamic MCP server discovery (highest priority)
+            message_keywords = self._extract_discovery_keywords_from_message(message)
+            needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
+                message, message_keywords
+            )
+
+            if needs_dynamic_discovery:
+                self.logger.info(
+                    f"🎯 PRIORITY: Dynamic MCP discovery detected for: {message[:50]}... keywords: {message_keywords}"
+                )
+
+                # Select appropriate agent type for the discovered tools
+                # Default to data_researcher for database queries, but could be more intelligent
+                agent_type = "data_researcher"  # This agent can work with any MCP tools
+
+                return {
+                    "required_agents": [agent_type],
+                    "complexity": "dynamic",
+                    "estimated_tasks": 1,
+                    "execution_strategy": "dynamic_discovery",
+                    "priority": "high",
+                    "task_description": f"Dynamic MCP discovery for qualified services",
+                    "reasoning": f"Detected NAME TOOL patterns requiring database server discovery",
+                    "intent_name": f"dynamic_discovery_{agent_type}",
+                    "confidence": "high",
+                    "requires_tools": [],
+                    "discovery_keywords": message_keywords,
+                    "qualified_services": True,
+                }
+
+            # 🚀 SECOND: Dynamic pattern matching (bypass LLM for common requests)
             pattern_match = self._dynamic_pattern_match(message)
             if pattern_match:
                 agent_type = pattern_match["agent"]
@@ -1117,6 +1249,7 @@ class SlackMetaAgent:
                     f"⚡ Dynamic pattern match: {message[:50]}... -> {agent_type} "
                     f"(confidence: {confidence:.2f}, keywords: {matched_keywords[:3]})"
                 )
+
                 return {
                     "required_agents": [agent_type],
                     "complexity": "simple",
@@ -1132,7 +1265,7 @@ class SlackMetaAgent:
                     "matched_keywords": matched_keywords,
                 }
 
-            # Fall back to LLM routing for complex/ambiguous requests
+            # 🤖 THIRD: Fall back to LLM routing for complex/ambiguous requests
             self.logger.info(f"🤖 Using LLM routing for: {message[:50]}...")
 
             # Get fresh tool discovery (with caching)
@@ -1176,67 +1309,89 @@ class SlackMetaAgent:
             from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 
             # Create a temporary agent to use OpenAI for routing
-            routing_agent = Agent(
-                name="dynamic_router",
-                instruction="You are a routing agent that analyzes user requests and selects the best specialized agent.",
-                server_names=[],  # No MCP servers needed for routing
-            )
-
-            async with routing_agent:
-                llm = await routing_agent.attach_llm(OpenAIAugmentedLLM)
-                routing_result = await llm.generate_str(routing_prompt)
-
-                # Parse the JSON response
-                import json
-
-                try:
-                    parsed_result = json.loads(routing_result)
-                except json.JSONDecodeError:
-                    # Extract JSON from the response if it's wrapped in text
-                    import re
-
-                    json_match = re.search(r"\{.*\}", routing_result, re.DOTALL)
-                    if json_match:
-                        parsed_result = json.loads(json_match.group())
-                    else:
-                        raise ValueError("Could not parse routing response")
-
-                        # Validate and format the response
-                selected_agent = parsed_result.get("selected_agent", "data_researcher")
-
-                # Normalize agent name (case-insensitive matching)
-                selected_agent_lower = selected_agent.lower()
-                if selected_agent_lower in self.agent_registry:
-                    selected_agent = selected_agent_lower
-                elif selected_agent not in self.agent_registry:
-                    self.logger.warning(
-                        f"Unknown agent {selected_agent}, defaulting to data_researcher"
-                    )
-                    selected_agent = "data_researcher"
-
-                analysis = {
-                    "required_agents": [selected_agent],
-                    "complexity": parsed_result.get("complexity", "simple"),
-                    "estimated_tasks": parsed_result.get("estimated_tasks", 1),
-                    "execution_strategy": parsed_result.get(
-                        "execution_strategy", "single_agent"
-                    ),
-                    "priority": "high"
-                    if parsed_result.get("confidence") == "high"
-                    else "medium",
-                    "task_description": f"Dynamic routing to {selected_agent}",
-                    "reasoning": parsed_result.get(
-                        "reasoning", "Dynamic tool-based routing"
-                    ),
-                    "intent_name": f"dynamic_{selected_agent}",
-                    "confidence": parsed_result.get("confidence", "medium"),
-                    "requires_tools": parsed_result.get("requires_tools", []),
-                }
-
-                self.logger.info(
-                    f"🎯 Dynamic routing: {message[:50]}... -> {selected_agent} (confidence: {analysis['confidence']})"
+            if self.mcp_app:
+                # Use MCPApp to create routing agent
+                routing_agent = await self.mcp_app.create_agent(
+                    name="dynamic_router",
+                    instruction="You are a routing agent that analyzes user requests and selects the best specialized agent.",
+                    server_names=[],  # No MCP servers needed for routing
                 )
-                return analysis
+            else:
+                # Fallback to direct Agent creation
+                routing_agent = Agent(
+                    name="dynamic_router",
+                    instruction="You are a routing agent that analyzes user requests and selects the best specialized agent.",
+                    server_names=[],  # No MCP servers needed for routing
+                )
+
+            try:
+                async with routing_agent:
+                    llm = await routing_agent.attach_llm(OpenAIAugmentedLLM)
+                    routing_result = await llm.generate_str(routing_prompt)
+
+                    # Parse the JSON response
+                    import json
+
+                    try:
+                        parsed_result = json.loads(routing_result)
+                    except json.JSONDecodeError:
+                        # Extract JSON from the response if it's wrapped in text
+                        import re
+
+                        json_match = re.search(r"\{.*\}", routing_result, re.DOTALL)
+                        if json_match:
+                            parsed_result = json.loads(json_match.group())
+                        else:
+                            raise ValueError("Could not parse routing response")
+
+                            # Validate and format the response
+                    selected_agent = parsed_result.get(
+                        "selected_agent", "data_researcher"
+                    )
+
+                    # Normalize agent name (case-insensitive matching)
+                    selected_agent_lower = selected_agent.lower()
+                    if selected_agent_lower in self.agent_registry:
+                        selected_agent = selected_agent_lower
+                    elif selected_agent not in self.agent_registry:
+                        self.logger.warning(
+                            f"Unknown agent {selected_agent}, defaulting to data_researcher"
+                        )
+                        selected_agent = "data_researcher"
+
+                    analysis = {
+                        "required_agents": [selected_agent],
+                        "complexity": parsed_result.get("complexity", "simple"),
+                        "estimated_tasks": parsed_result.get("estimated_tasks", 1),
+                        "execution_strategy": parsed_result.get(
+                            "execution_strategy", "single_agent"
+                        ),
+                        "priority": "high"
+                        if parsed_result.get("confidence") == "high"
+                        else "medium",
+                        "task_description": f"Dynamic routing to {selected_agent}",
+                        "reasoning": parsed_result.get(
+                            "reasoning", "Dynamic tool-based routing"
+                        ),
+                        "intent_name": f"dynamic_{selected_agent}",
+                        "confidence": parsed_result.get("confidence", "medium"),
+                        "requires_tools": parsed_result.get("requires_tools", []),
+                    }
+
+                    self.logger.info(
+                        f"🎯 Dynamic routing: {message[:50]}... -> {selected_agent} (confidence: {analysis['confidence']})"
+                    )
+                    return analysis
+
+            finally:
+                # Step 4: Clean up dynamic agent
+                try:
+                    await routing_agent.__aexit__(None, None, None)
+                    self.logger.info("🧹 Cleaned up dynamic agent")
+                except Exception as cleanup_error:
+                    self.logger.warning(
+                        f"Dynamic agent cleanup warning: {cleanup_error}"
+                    )
 
         except Exception as e:
             self.logger.error(f"Dynamic routing error: {e}")
@@ -1301,6 +1456,13 @@ class SlackMetaAgent:
             ):
                 self.logger.info("🔍 Performing system capability introspection")
                 return await self._perform_capability_introspection()
+
+            # 🚀 NEW: Handle dynamic MCP discovery execution strategy
+            if intent_analysis.get("execution_strategy") == "dynamic_discovery":
+                self.logger.info("🔍 Executing dynamic MCP server discovery workflow")
+                return await self._execute_dynamic_discovery_workflow(
+                    intent_analysis, message, agents
+                )
 
             # For simple single-agent requests, execute directly
             if (
@@ -1376,60 +1538,69 @@ class SlackMetaAgent:
 
                 try:
                     # Create a temporary agent to inspect its capabilities
-                    temp_agent = await self.create_specialized_agent(agent_type)
+                    if self.mcp_app:
+                        temp_agent = Agent(
+                            name=f"inspect_{agent_type}",
+                            instruction=spec.instruction,
+                            server_names=spec.server_names,
+                            context=self.mcp_app.context,  # Pass MCPApp context
+                        )
+                        await temp_agent.__aenter__()
+                    else:
+                        temp_agent = Agent(
+                            name=f"inspect_{agent_type}",
+                            instruction=spec.instruction,
+                            server_names=spec.server_names,
+                        )
+                        await temp_agent.__aenter__()
 
-                    async with temp_agent:
-                        # Get server capabilities
-                        if spec.server_names:
-                            server_capabilities = {}
-                            for server_name in spec.server_names:
-                                try:
-                                    caps = await temp_agent.get_capabilities(
-                                        server_name
-                                    )
-                                    tools = await temp_agent.list_tools(server_name)
+                    # Get server capabilities
+                    if spec.server_names:
+                        server_capabilities = {}
+                        for server_name in spec.server_names:
+                            try:
+                                caps = await temp_agent.get_capabilities(server_name)
+                                tools = await temp_agent.list_tools(server_name)
 
-                                    server_capabilities[server_name] = {
-                                        "capabilities": caps.model_dump()
-                                        if caps
-                                        else {},
-                                        "tools": [
-                                            {
-                                                "name": tool.name,
-                                                "description": tool.description,
-                                            }
-                                            for tool in tools.tools
-                                        ]
-                                        if tools
-                                        else [],
-                                    }
-                                    capabilities_info["total_tools"] += (
-                                        len(tools.tools) if tools else 0
-                                    )
+                                server_capabilities[server_name] = {
+                                    "capabilities": caps.model_dump() if caps else {},
+                                    "tools": [
+                                        {
+                                            "name": tool.name,
+                                            "description": tool.description,
+                                        }
+                                        for tool in tools.tools
+                                    ]
+                                    if tools
+                                    else [],
+                                }
+                                capabilities_info["total_tools"] += (
+                                    len(tools.tools) if tools else 0
+                                )
 
-                                except Exception as e:
-                                    self.logger.warning(
-                                        f"Could not get capabilities for {server_name}: {e}"
-                                    )
-                                    server_capabilities[server_name] = {"error": str(e)}
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"Could not get capabilities for {server_name}: {e}"
+                                )
+                                server_capabilities[server_name] = {"error": str(e)}
 
-                            capabilities_info["specialized_agents"][agent_type] = {
-                                "description": spec.instruction[:200] + "..."
-                                if len(spec.instruction) > 200
-                                else spec.instruction,
-                                "server_names": spec.server_names,
-                                "capabilities": spec.capabilities,
-                                "server_details": server_capabilities,
-                            }
-                        else:
-                            capabilities_info["specialized_agents"][agent_type] = {
-                                "description": spec.instruction[:200] + "..."
-                                if len(spec.instruction) > 200
-                                else spec.instruction,
-                                "server_names": [],
-                                "capabilities": spec.capabilities,
-                                "server_details": {},
-                            }
+                        capabilities_info["specialized_agents"][agent_type] = {
+                            "description": spec.instruction[:200] + "..."
+                            if len(spec.instruction) > 200
+                            else spec.instruction,
+                            "server_names": spec.server_names,
+                            "capabilities": spec.capabilities,
+                            "server_details": server_capabilities,
+                        }
+                    else:
+                        capabilities_info["specialized_agents"][agent_type] = {
+                            "description": spec.instruction[:200] + "..."
+                            if len(spec.instruction) > 200
+                            else spec.instruction,
+                            "server_names": [],
+                            "capabilities": spec.capabilities,
+                            "server_details": {},
+                        }
 
                 except Exception as e:
                     self.logger.warning(f"Could not introspect {agent_type}: {e}")
@@ -1605,13 +1776,24 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
             query = f"""INSERT INTO interactions (user_id, channel_id, message, created_at) 
                        VALUES ('{user_id}', '{channel_id}', '{message.replace("'", "''")}', '{conversation_entry["timestamp"]}');"""
 
-            # This would require importing the MCP function - for now let's keep the agent approach but fix it
-            supabase_agent = Agent(
-                name="memory_store",
-                instruction="Execute SQL directly",
-                server_names=["supabase"],
-            )
-            async with supabase_agent:
+            # Create agent for Supabase operations
+            if self.mcp_app:
+                supabase_agent = Agent(
+                    name="memory_store",
+                    instruction="Execute SQL directly",
+                    server_names=["supabase"],
+                    context=self.mcp_app.context,  # Pass MCPApp context
+                )
+                await supabase_agent.__aenter__()
+            else:
+                supabase_agent = Agent(
+                    name="memory_store",
+                    instruction="Execute SQL directly",
+                    server_names=["supabase"],
+                )
+                await supabase_agent.__aenter__()
+
+            try:
                 llm = await supabase_agent.attach_llm(OpenAIAugmentedLLM)
 
                 # Ask the LLM to use the execute_sql tool with specific instructions
@@ -1629,6 +1811,13 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                     if len(result) > 100
                     else f"✅ Stored conversation memory for user {user_id}: {result}"
                 )
+            finally:
+                # Clean up agent if we created it manually
+                if not self.mcp_app:
+                    try:
+                        await supabase_agent.__aexit__(None, None, None)
+                    except:  # noqa: E722
+                        pass
 
         except Exception as e:
             self.logger.warning(f"Could not store to Supabase: {e}")
@@ -1658,12 +1847,23 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                            NOW()
                        );"""
 
-            supabase_agent = Agent(
-                name="learning_store",
-                instruction="Execute SQL directly",
-                server_names=["supabase"],
-            )
-            async with supabase_agent:
+            if self.mcp_app:
+                supabase_agent = Agent(
+                    name="learning_store",
+                    instruction="Execute SQL directly",
+                    server_names=["supabase"],
+                    context=self.mcp_app.context,  # Pass MCPApp context
+                )
+                await supabase_agent.__aenter__()
+            else:
+                supabase_agent = Agent(
+                    name="learning_store",
+                    instruction="Execute SQL directly",
+                    server_names=["supabase"],
+                )
+                await supabase_agent.__aenter__()
+
+            try:
                 llm = await supabase_agent.attach_llm(OpenAIAugmentedLLM)
 
                 # Ask the LLM to use the execute_sql tool with specific instructions
@@ -1685,6 +1885,13 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                     if len(learning_result) > 100
                     else f"✅ Stored interaction learning for user {user_id}: {learning_result}"
                 )
+            finally:
+                # Clean up agent if we created it manually
+                if not self.mcp_app:
+                    try:
+                        await supabase_agent.__aexit__(None, None, None)
+                    except:  # noqa: E722
+                        pass
 
         except Exception as e:
             self.logger.warning(f"Could not store learning data: {e}")
@@ -1787,12 +1994,23 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
     async def verify_database_data(self):
         """Verify that data was actually inserted into the database"""
         try:
-            supabase_agent = Agent(
-                name="data_checker",
-                instruction="Query database to check for data",
-                server_names=["supabase"],
-            )
-            async with supabase_agent:
+            if self.mcp_app:
+                supabase_agent = Agent(
+                    name="data_checker",
+                    instruction="Query database to check for data",
+                    server_names=["supabase"],
+                    context=self.mcp_app.context,  # Pass MCPApp context
+                )
+                await supabase_agent.__aenter__()
+            else:
+                supabase_agent = Agent(
+                    name="data_checker",
+                    instruction="Query database to check for data",
+                    server_names=["supabase"],
+                )
+                await supabase_agent.__aenter__()
+
+            try:
                 llm = await supabase_agent.attach_llm(OpenAIAugmentedLLM)
 
                 # Ask the LLM to query the database
@@ -1806,6 +2024,13 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
                 self.logger.info(f"📊 Database verification result: {result}")
                 return result
+            finally:
+                # Clean up agent if we created it manually
+                if not self.mcp_app:
+                    try:
+                        await supabase_agent.__aexit__(None, None, None)
+                    except:  # noqa: E722
+                        pass
 
         except Exception as e:
             self.logger.error(f"❌ Database verification failed: {e}")
@@ -1915,6 +2140,113 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 "last_cleanup": self.last_cleanup_time.isoformat(),
             },
         }
+
+    async def slack_human_input_callback(self, request: HumanInputRequest) -> str:
+        """Handle human input requests by sending them to Slack and waiting for response"""
+        try:
+            if not self.slack_client or not self.current_thread_ts:
+                self.logger.warning(
+                    "No Slack client or thread context for human input, falling back to console"
+                )
+                return console_input_callback(request)
+
+            # Extract context from current conversation
+            channel_id = getattr(self, "current_channel_id", None)
+            user_id = getattr(self, "current_user_id", None)
+
+            if not channel_id or not user_id:
+                self.logger.warning(
+                    "No channel/user context for human input, falling back to console"
+                )
+                return console_input_callback(request)
+
+            self.logger.info(
+                f"🤖 Sending human input request to Slack for user {user_id}"
+            )
+
+            # Format the human input request for Slack
+            formatted_message = f"""🤖 **Agent needs more information:**
+
+{request.prompt}
+
+💡 **Instructions:** {request.instructions or "Please provide the requested information."}
+
+*Reply in this thread to continue...*
+"""
+
+            # Send the human input request to Slack
+            response = self.slack_client.chat_postMessage(
+                channel=channel_id,
+                text=formatted_message,
+                parse="mrkdwn",
+                thread_ts=self.current_thread_ts,
+            )
+
+            if not response["ok"]:
+                self.logger.error(
+                    f"Failed to send human input request to Slack: {response}"
+                )
+                return console_input_callback(request)
+
+            # Create a Future to wait for the user's response
+            response_future = asyncio.Future()
+            self.pending_human_inputs[user_id] = response_future
+
+            self.logger.info(f"⏳ Waiting for human input response from user {user_id}")
+
+            # Wait for the user's response (with timeout)
+            try:
+                user_response = await asyncio.wait_for(
+                    response_future, timeout=300.0
+                )  # 5 minute timeout
+                self.logger.info(
+                    f"✅ Received human input response: {user_response[:50]}..."
+                )
+                return user_response
+
+            except asyncio.TimeoutError:
+                self.logger.warning("⏰ Human input request timed out")
+                # Clean up the pending request
+                if user_id in self.pending_human_inputs:
+                    del self.pending_human_inputs[user_id]
+
+                # Send timeout message to Slack
+                self.slack_client.chat_postMessage(
+                    channel=channel_id,
+                    text="⏰ **Request timed out** - Please try your original request again.",
+                    parse="mrkdwn",
+                    thread_ts=self.current_thread_ts,
+                )
+
+                return "Request timed out. Please try again."
+
+        except Exception as e:
+            self.logger.error(f"Error in Slack human input callback: {e}")
+            import traceback
+
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return console_input_callback(request)
+
+    def _clean_user_input(self, message_text: str) -> str:
+        """Clean user input by removing mentions, formatting, etc."""
+        import re
+
+        # Remove bot mentions (e.g., <@U0933UC9QEB>)
+        clean_text = re.sub(r"<@[A-Z0-9]+>", "", message_text).strip()
+
+        # Remove channel mentions (e.g., <#C1234567890>)
+        clean_text = re.sub(r"<#[A-Z0-9]+\|[^>]+>", "", clean_text).strip()
+
+        # Remove URL formatting (e.g., <https://example.com|example.com>)
+        clean_text = re.sub(r"<[^>]+\|[^>]+>", "", clean_text).strip()
+
+        # Remove simple URL wrapping (e.g., <https://example.com>)
+        clean_text = re.sub(r"<(https?://[^>]+)>", r"\1", clean_text).strip()
+
+        # Clean up multiple spaces
+        clean_text = re.sub(r"\s+", " ", clean_text).strip()
+
+        return clean_text
 
     async def cleanup(self):
         """Clean up pooled agents and connections"""
@@ -2142,6 +2474,184 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
         return results
 
+    async def _dynamic_mcp_server_discovery(
+        self, query_keywords: List[str]
+    ) -> List[Dict]:
+        """
+        Dynamically discover MCP servers from database based on query keywords
+        This is called when current agents don't have the required tools
+        """
+        try:
+            self.logger.info(f"🔍 Dynamic MCP discovery for keywords: {query_keywords}")
+
+            # Query database for MCP servers that match the keywords
+            from mcp_agent.agents.agent import Agent
+            from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+
+            if self.mcp_app:
+                discovery_agent = Agent(
+                    name="mcp_discovery_agent",
+                    instruction="Query database for MCP server configurations",
+                    server_names=["supabase"],
+                    context=self.mcp_app.context,  # Pass MCPApp context
+                )
+                await discovery_agent.__aenter__()
+            else:
+                discovery_agent = Agent(
+                    name="mcp_discovery_agent",
+                    instruction="Query database for MCP server configurations",
+                    server_names=["supabase"],
+                )
+                await discovery_agent.__aenter__()
+
+            discovered_servers = []
+
+            try:
+                llm = await discovery_agent.attach_llm(OpenAIAugmentedLLM)
+
+                # Build keyword search conditions for qualified service names
+                keyword_conditions = []
+                for keyword in query_keywords:
+                    # Search in server_name, display_name, and description (properly qualified)
+                    keyword_conditions.append(
+                        f"LOWER(s.server_name) LIKE LOWER('%{keyword}%')"
+                    )
+                    keyword_conditions.append(
+                        f"LOWER(s.display_name) LIKE LOWER('%{keyword}%')"
+                    )
+                    keyword_conditions.append(
+                        f"LOWER(s.description) LIKE LOWER('%{keyword}%')"
+                    )
+
+                    # TODO: Add environment variables search once we know the correct column names
+                    # For now, search only in main server fields
+
+                where_clause = " OR ".join(keyword_conditions)
+
+                self.logger.info(
+                    f"🔍 Searching for qualified services with keywords: {query_keywords}"
+                )
+
+                sql_query = f"""
+                SELECT 
+                    s.server_name,
+                    s.display_name,
+                    s.description,
+                    s.transport,
+                    s.url,
+                    s.command,
+                    s.args
+                FROM mcp_servers s
+                JOIN mcp_configurations c ON s.configuration_id = c.id
+                WHERE c.is_active = true 
+                AND s.is_enabled = true
+                AND ({where_clause})
+                ORDER BY s.priority ASC;
+                """
+
+                prompt = f"""
+                Query the database to find MCP servers that match these keywords: {query_keywords}
+                
+                Use the execute_sql tool with:
+                - project_id: "{self.supabase_project_id}"
+                - query: "{sql_query}"
+                
+                Execute the SQL query and return the server details.
+                """
+
+                result = await llm.generate_str(prompt)
+                self.logger.info(f"🔍 Database query result: {result[:200]}...")
+
+                # Parse the result to extract server configurations from database
+                discovered_servers = self._parse_mcp_query_result(result)
+
+                if discovered_servers:
+                    self.logger.info(
+                        f"✅ Found {len(discovered_servers)} specialized servers from database"
+                    )
+                else:
+                    self.logger.info(
+                        "💡 No specialized servers found in database for these keywords"
+                    )
+                    # NO FALLBACK - completely database-driven
+
+                self.logger.info(
+                    f"🎯 Discovered {len(discovered_servers)} matching MCP servers"
+                )
+                for server in discovered_servers:
+                    self.logger.info(
+                        f"   - {server['server_name']}: {server['description']}"
+                    )
+
+                return discovered_servers
+            finally:
+                # Clean up agent if we created it manually
+                if not self.mcp_app:
+                    try:
+                        await discovery_agent.__aexit__(None, None, None)
+                    except:  # noqa: E722
+                        pass
+
+        except Exception as e:
+            self.logger.warning(f"Dynamic MCP discovery failed: {e}")
+            import traceback
+
+            self.logger.warning(f"Discovery error: {traceback.format_exc()}")
+            return []
+
+    async def _create_dynamic_agent_with_servers(
+        self, server_configs: List[Dict], agent_name: str = "dynamic_agent"
+    ) -> Optional[Agent]:
+        """
+        Create a temporary agent with dynamically discovered MCP servers
+        """
+        try:
+            server_names = [config["server_name"] for config in server_configs]
+
+            self.logger.info(f"🚀 Creating dynamic agent with servers: {server_names}")
+
+            # Create agent with discovered servers
+            if self.mcp_app:
+                # Create agent with MCPApp context for proper server registry access
+                dynamic_agent = Agent(
+                    name=f"{agent_name}_{int(datetime.now().timestamp())}",
+                    instruction=f"""You are a dynamic agent with access to specialized MCP servers: {", ".join(server_names)}.
+                    
+                    Use these servers to fulfill user requests. Focus on:
+                    - Using the most appropriate server for each task
+                    - Providing specific, actionable results
+                    - Including relevant URLs, IDs, or identifiers in responses
+                    
+                    Available servers: {[f"{s['server_name']}: {s['description']}" for s in server_configs]}""",
+                    server_names=server_names,
+                    context=self.mcp_app.context,  # Pass MCPApp context
+                )
+                await dynamic_agent.__aenter__()
+            else:
+                # Fallback to direct Agent creation
+                dynamic_agent = Agent(
+                    name=f"{agent_name}_{int(datetime.now().timestamp())}",
+                    instruction=f"""You are a dynamic agent with access to specialized MCP servers: {", ".join(server_names)}.
+                    
+                    Use these servers to fulfill user requests. Focus on:
+                    - Using the most appropriate server for each task
+                    - Providing specific, actionable results
+                    - Including relevant URLs, IDs, or identifiers in responses
+                    
+                    Available servers: {[f"{s['server_name']}: {s['description']}" for s in server_configs]}""",
+                    server_names=server_names,
+                )
+                await dynamic_agent.__aenter__()
+
+            self.logger.info(
+                f"✅ Dynamic agent created with {len(server_names)} servers"
+            )
+            return dynamic_agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create dynamic agent: {e}")
+            return None
+
 
 # Legacy MetaAgent class for backward compatibility
 class MetaAgent(SlackMetaAgent):
@@ -2152,7 +2662,79 @@ class MetaAgent(SlackMetaAgent):
 
 async def main():
     """Main function to run the Slack Meta-Agent system"""
-    # Load configuration
+
+    # 🗂️ Initialize Supabase logging FIRST (before Meta-Agent system)
+    supabase_project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
+    session_id, supabase_handler = setup_supabase_logging(
+        project_id=supabase_project_id,
+        level="INFO",
+        use_session_aggregation=True,  # Use session aggregation to combine all logs into one record
+    )
+
+    print(f"🗂️ Logging Session (Aggregated): {session_id}")
+
+    # 🎯 DATABASE CONFIGURATION SYSTEM
+    # Check if we should use database configuration
+    config_name = os.getenv(
+        "MCP_CONFIG_NAME", "slack_meta_agent"
+    )  # Default to production-ready config
+    use_database_config = os.getenv("USE_DATABASE_CONFIG", "true").lower() in [
+        "true",
+        "1",
+        "yes",
+    ]
+
+    print(f"📊 Configuration Mode: {'Database' if use_database_config else 'YAML'}")
+
+    if use_database_config:
+        try:
+            print(f"🔍 Loading configuration '{config_name}' from database...")
+
+            # Set environment variables for database connection
+            os.environ.setdefault("SUPABASE_PROJECT_ID", supabase_project_id)
+            os.environ.setdefault(
+                "SUPABASE_ANON_KEY",
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxZ2dkdmZleWJmenFtZ3htaWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTExNTA2MjEsImV4cCI6MjA2NjcyNjYyMX0.aDsWKJjhYqh-Ptq63LnP5YGnMsTiXxAbI9gMi09UEs0",
+            )
+
+            # Load configuration from database
+            settings = await get_settings_from_database(
+                config_name=config_name,
+                config_path="mcp_agent.config.yaml",  # fallback
+            )
+
+            if settings and settings.mcp and settings.mcp.servers:
+                print(f"✅ Database configuration loaded!")
+                print(f"   - Servers: {list(settings.mcp.servers.keys())}")
+                if "arc_supabase" in settings.mcp.servers:
+                    print(f"   - 🔗 ARC Supabase: Connected")
+            else:
+                print(f"⚠️  Database config incomplete, using YAML fallback")
+
+            # Create MCPApp with database configuration (callback will be set up later)
+            app_instance = MCPApp(
+                name="slack_meta_agent_db",
+                settings=settings,
+                human_input_callback=console_input_callback,
+            )
+
+        except Exception as e:
+            print(f"❌ Database configuration failed: {e}")
+            print(f"🔄 Falling back to YAML configuration...")
+            # Fallback to YAML
+            app_instance = MCPApp(
+                name="slack_meta_agent", human_input_callback=console_input_callback
+            )
+    else:
+        print(
+            f"📄 Using YAML configuration (set USE_DATABASE_CONFIG=true to enable database)"
+        )
+        # Use traditional YAML configuration - will update callback later
+        app_instance = MCPApp(
+            name="slack_meta_agent", human_input_callback=console_input_callback
+        )
+
+    # Load Slack tokens from secrets (still need this regardless of MCP config)
     from pathlib import Path
 
     secrets_file = Path(__file__).parent / "mcp_agent.secrets.yaml"
@@ -2180,26 +2762,22 @@ async def main():
         print("🔧 Run 'python setup.py' for setup guidance.")
         return
 
-    # 🗂️ Initialize Supabase logging FIRST (before Meta-Agent system)
-    supabase_project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
-    session_id, supabase_handler = setup_supabase_logging(
-        project_id=supabase_project_id,
-        level="INFO",
-        use_session_aggregation=True,  # Use session aggregation to combine all logs into one record
-    )
-
-    print(f"🗂️ Logging Session (Aggregated): {session_id}")
-
     # Initialize the Meta-Agent system
-    async with app.run() as agent_app:
+    async with app_instance.run() as agent_app:
         logger = logging.getLogger(
             "SlackMetaAgent"
         )  # Use consistent logger for session aggregation
 
-        # Create and initialize the meta-agent
-        meta_agent = SlackMetaAgent(supabase_project_id=supabase_project_id)
+        # Create and initialize the meta-agent with MCPApp context
+        meta_agent = SlackMetaAgent(
+            supabase_project_id=supabase_project_id,
+            mcp_app=agent_app,  # Pass the MCPApp instance
+        )
         meta_agent.session_id = session_id
         meta_agent.supabase_log_handler = supabase_handler
+
+        # Note: Human input will be handled through Slack message threading
+        # The console_input_callback is used as fallback for non-Slack scenarios
 
         try:
             # Load dynamic configuration
@@ -2269,25 +2847,6 @@ async def main():
                     )
             else:
                 logger.info("💡 Skipping database test (set TEST_DB=true to enable)")
-
-            # Test dynamic routing to verify the new tool-discovery system works
-            # logger.info("🧪 Testing dynamic routing system...")
-            # routing_test_results = await meta_agent.test_dynamic_routing()
-
-            # # Show key results
-            # successful_tests = sum(
-            #     1 for r in routing_test_results if r.get("success", False)
-            # )
-            # total_tests = len(routing_test_results)
-
-            # if successful_tests >= total_tests * 0.8:  # 80% success rate
-            #     logger.info(
-            #         f"🎉 Dynamic routing system working excellently! ({successful_tests}/{total_tests} passed)"
-            #     )
-            # else:
-            #     logger.warning(
-            #         f"⚠️  Dynamic routing needs improvement: {successful_tests}/{total_tests} tests passed"
-            #     )
 
             logger.info("💡 Skipping dynamic routing startup test for faster boot")
 
