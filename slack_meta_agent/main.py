@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import uuid
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 import logging
@@ -12,6 +13,9 @@ from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
 from mcp_agent.human_input.handler import console_input_callback
 from rich import print
+
+# Import our custom Supabase logging
+from supabase_logger import setup_supabase_logging
 
 # Slack integration imports
 try:
@@ -80,7 +84,7 @@ class ConversationState:
 class SlackMetaAgent:
     """The main meta-agent that orchestrates all other agents and handles Slack interactions"""
 
-    def __init__(self):
+    def __init__(self, supabase_project_id: str = None):
         self.specialized_agents: Dict[str, Agent] = {}
         self.agent_registry: Dict[str, AgentSpec] = self._initialize_agent_registry()
         self.conversation_memory: Dict[
@@ -94,6 +98,9 @@ class SlackMetaAgent:
         self.socket_client: Optional[SocketModeClient] = None
         self.logger = logging.getLogger("SlackMetaAgent")
         self.event_loop = None
+        self.supabase_project_id = supabase_project_id
+        self.session_id = None
+        self.supabase_log_handler = None
 
         # Dynamic tool discovery cache
         self.discovered_tools: Optional[Dict[str, Dict]] = None
@@ -1898,6 +1905,13 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
         self.agent_pool.clear()
         self.agent_pool_initialized = False
 
+        # Clean up Supabase logging
+        if self.supabase_log_handler:
+            try:
+                await self.supabase_log_handler.close()
+            except Exception as e:
+                print(f"⚠️ Could not clean up Supabase logging: {e}")
+
     async def _send_enhanced_slack_response(
         self,
         channel_id: str,
@@ -2136,12 +2150,23 @@ async def main():
         print("🔧 Run 'python setup.py' for setup guidance.")
         return
 
+    # 🗂️ Initialize Supabase logging FIRST (before Meta-Agent system)
+    supabase_project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
+    session_id, supabase_handler = setup_supabase_logging(
+        project_id=supabase_project_id, level="INFO"
+    )
+
+    print(f"🗂️ Supabase logging active - Session: {session_id}")
+    print("💾 All logs now stored in Supabase instead of local files")
+
     # Initialize the Meta-Agent system
     async with app.run() as agent_app:
         logger = agent_app.logger
 
         # Create and initialize the meta-agent
-        meta_agent = SlackMetaAgent()
+        meta_agent = SlackMetaAgent(supabase_project_id=supabase_project_id)
+        meta_agent.session_id = session_id
+        meta_agent.supabase_log_handler = supabase_handler
 
         try:
             # Load dynamic configuration
@@ -2221,11 +2246,13 @@ async def main():
             logger.info("   📚 Persistent Learning (patterns saved to file)")
             logger.info("   🔄 Connection Health Monitoring (auto-recovery)")
             logger.info("   📊 30-minute Tool Discovery Cache")
+            logger.info("   🗂️ Supabase Log Storage (no more local log files)")
             logger.info("")
             logger.info(
                 "   Expected performance: Weather ~1-3s, Complex requests ~5-15s"
             )
             logger.info("   Security: ✅ Request isolation, ✅ No shared state")
+            logger.info(f"   Logging: ✅ Session {session_id} → Supabase")
 
             # Start the WebSocket connection
             await meta_agent.start_slack_connection()

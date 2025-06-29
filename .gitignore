@@ -180,4 +180,5 @@ examples/**/*.jsonl
 
 mcp_agent.secrets.yaml
 
-/slack_meta_agent/logs
+# Slack Meta Agent Logs (should be stored in Supabase)
+
