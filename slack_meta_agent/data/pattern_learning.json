@@ -75,13 +75,13 @@
   },
   "automation": {
     "keywords": [
-      "n8n",
       "workflow",
       "automate",
       "trigger",
       "airtable",
       "automation",
-      "zapier"
+      "zapier",
+      "workflow automation"
     ],
     "agent": "automation_specialist",
     "confidence": 0.85,
@@ -100,9 +100,42 @@
       "called",
       "server",
       "need",
-      "like"
+      "like",
+      "texas",
+      "right",
+      "now?",
+      "austin",
+      "weather"
     ],
     "agent": "data_researcher",
+    "confidence": 0.7,
+    "usage_count": 0
+  },
+  "feedback_collector": {
+    "keywords": [
+      "work.",
+      "will",
+      "test",
+      "this",
+      "note.",
+      "feedback",
+      "<@u0933uc9qeb>",
+      "some",
+      "wondering",
+      "have"
+    ],
+    "agent": "feedback_collector",
+    "confidence": 0.7,
+    "usage_count": 0
+  },
+  "airtable_manager": {
+    "keywords": [
+      "bases",
+      "what",
+      "<@u0933uc9qeb>",
+      "airtable?"
+    ],
+    "agent": "airtable_manager",
     "confidence": 0.7,
     "usage_count": 0
   }

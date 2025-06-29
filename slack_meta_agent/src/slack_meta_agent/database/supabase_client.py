@@ -6,6 +6,8 @@ Bypasses MCP infrastructure for speed and reliability
 import json
 import asyncio
 import aiohttp
+import secrets
+import string
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import logging
@@ -37,6 +39,306 @@ class SupabaseDirectClient:
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }
+
+    def _is_secret_field(self, field_name: str, value: str) -> bool:
+        """Detect if a field contains sensitive information that should be stored as a secret"""
+        if not value or not isinstance(value, str):
+            return False
+
+        field_lower = field_name.lower()
+
+        # Field name patterns that indicate secrets
+        secret_patterns = [
+            "api_key",
+            "apikey",
+            "api-key",
+            "token",
+            "access_token",
+            "auth_token",
+            "bearer_token",
+            "secret",
+            "client_secret",
+            "app_secret",
+            "password",
+            "passwd",
+            "pwd",
+            "key",
+            "private_key",
+            "public_key",
+            "credential",
+            "credentials",
+            "auth",
+            "authorization",
+            "webhook_secret",
+            "signing_secret",
+        ]
+
+        # Check if field name matches secret patterns
+        if any(pattern in field_lower for pattern in secret_patterns):
+            return True
+
+        # Value patterns that look like secrets (heuristics)
+        value_stripped = value.strip()
+
+        # Check for common API key formats
+        if (
+            # Starts with common prefixes
+            any(
+                value_stripped.startswith(prefix)
+                for prefix in [
+                    "sk-",
+                    "pk-",
+                    "rk-",
+                    "xoxb-",
+                    "xoxp-",
+                    "Bearer ",
+                    "ghp_",
+                    "gho_",
+                    "AIza",
+                    "AKIA",
+                    "ya29",
+                    "ey",
+                ]
+            )
+            or
+            # Long alphanumeric strings (likely tokens)
+            (
+                len(value_stripped) >= 20
+                and value_stripped.replace("-", "").replace("_", "").isalnum()
+            )
+            or
+            # Base64-like patterns
+            (
+                len(value_stripped) >= 16
+                and value_stripped.replace("+", "")
+                .replace("/", "")
+                .replace("=", "")
+                .isalnum()
+            )
+        ):
+            return True
+
+        return False
+
+    def _generate_secret_name(self, server_name: str, field_name: str) -> str:
+        """Generate a unique secret name for storage"""
+        # Create a readable but unique secret name
+        timestamp = int(datetime.utcnow().timestamp())
+        random_suffix = "".join(
+            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)
+        )
+        return f"mcp_{server_name}_{field_name}_{timestamp}_{random_suffix}"
+
+    async def store_secret(
+        self, secret_name: str, secret_value: str, metadata: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """Store a secret in Supabase Vault using custom RPC function"""
+        try:
+            # Use service role key for Vault operations (required)
+            if not self.service_role_key:
+                raise Exception("Service role key required for Vault operations")
+
+            headers = {
+                "apikey": self.service_role_key,
+                "Authorization": f"Bearer {self.service_role_key}",
+                "Content-Type": "application/json",
+            }
+
+            description = metadata.get(
+                "description", f"MCP server secret: {secret_name}"
+            )
+
+            # Use our custom RPC function to create vault secret
+            rpc_data = {
+                "secret_value": secret_value,
+                "secret_name": secret_name,
+                "secret_description": description,
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/rest/v1/rpc/vault_create_secret",
+                    headers=headers,
+                    json=rpc_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status in [200, 201]:
+                        result = await response.json()
+                        vault_id = result if result else "unknown"
+                        self.logger.info(
+                            f"✅ Secret '{secret_name}' stored in Supabase Vault"
+                        )
+                        return {
+                            "success": True,
+                            "secret_name": secret_name,
+                            "vault_id": vault_id,  # Returns the UUID of the secret
+                        }
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(
+                            f"❌ Vault storage failed: {response.status} - {error_text}"
+                        )
+                        return {
+                            "success": False,
+                            "error": f"HTTP {response.status}: {error_text}",
+                        }
+
+        except Exception as e:
+            self.logger.error(f"❌ Vault storage error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def retrieve_secret(self, secret_name: str) -> Dict[str, Any]:
+        """Retrieve a secret from Supabase Vault using custom RPC function"""
+        try:
+            # Use service role key for Vault operations (required)
+            if not self.service_role_key:
+                raise Exception("Service role key required for Vault operations")
+
+            headers = {
+                "apikey": self.service_role_key,
+                "Authorization": f"Bearer {self.service_role_key}",
+                "Content-Type": "application/json",
+            }
+
+            # Use our custom RPC function to get vault secret
+            rpc_data = {"secret_name": secret_name}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/rest/v1/rpc/vault_get_secret",
+                    headers=headers,
+                    json=rpc_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if result:  # Result is the actual secret value
+                            self.logger.info(
+                                f"✅ Secret '{secret_name}' retrieved from Vault"
+                            )
+                            return {
+                                "success": True,
+                                "secret_value": result,
+                            }
+                        else:
+                            self.logger.warning(
+                                f"⚠️ Secret '{secret_name}' not found in Vault"
+                            )
+                            return {
+                                "success": False,
+                                "error": f"Secret '{secret_name}' not found in Vault",
+                            }
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(
+                            f"❌ Vault retrieval failed: {response.status} - {error_text}"
+                        )
+                        return {
+                            "success": False,
+                            "error": f"HTTP {response.status}: {error_text}",
+                        }
+
+        except Exception as e:
+            self.logger.error(f"❌ Vault retrieval error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def insert_mcp_server_secure(
+        self, server_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Insert MCP server configuration with automatic secrets management"""
+        try:
+            self.logger.info(
+                f"🔐 Inserting MCP server with secure secrets handling: {server_info['server_name']}"
+            )
+
+            # Step 1: Process secrets
+            processed_server_info = server_info.copy()
+            secret_references = {}
+
+            # Check all fields for secrets
+            for field_name, field_value in server_info.items():
+                if self._is_secret_field(field_name, field_value):
+                    self.logger.info(f"🔐 Detected secret field: {field_name}")
+
+                    # Generate secret name
+                    secret_name = self._generate_secret_name(
+                        server_info["server_name"], field_name
+                    )
+
+                    # Store secret
+                    secret_result = await self.store_secret(
+                        secret_name,
+                        field_value,
+                        metadata={
+                            "server_name": server_info["server_name"],
+                            "field_name": field_name,
+                            "description": f"Secret for {server_info['server_name']} - {field_name}",
+                        },
+                    )
+
+                    if secret_result["success"]:
+                        # Replace actual value with secret reference
+                        processed_server_info[field_name] = f"{{secret:{secret_name}}}"
+                        secret_references[field_name] = secret_name
+                        self.logger.info(
+                            f"✅ Secret stored as reference: {field_name} -> {secret_name}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"⚠️ Failed to store secret for {field_name}: {secret_result.get('error')}"
+                        )
+                        # Continue with original value (fallback)
+
+            # Step 2: Store server configuration with secret references
+            regular_result = await self.insert_mcp_server(processed_server_info)
+
+            if regular_result["success"]:
+                return {
+                    "success": True,
+                    "server_id": regular_result["server_id"],
+                    "secret_references": secret_references,
+                    "message": f"✅ Server '{server_info['server_name']}' added with {len(secret_references)} secrets secured",
+                }
+            else:
+                return regular_result
+
+        except Exception as e:
+            self.logger.error(f"❌ Secure server insertion error: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def resolve_server_secrets(
+        self, server_config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Resolve secret references in server configuration"""
+        try:
+            resolved_config = server_config.copy()
+
+            for field_name, field_value in server_config.items():
+                if (
+                    isinstance(field_value, str)
+                    and field_value.startswith("{secret:")
+                    and field_value.endswith("}")
+                ):
+                    # Extract secret name
+                    secret_name = field_value[8:-1]  # Remove {secret: and }
+
+                    # Retrieve secret
+                    secret_result = await self.retrieve_secret(secret_name)
+
+                    if secret_result["success"]:
+                        resolved_config[field_name] = secret_result["secret_value"]
+                        self.logger.debug(f"✅ Resolved secret: {field_name}")
+                    else:
+                        self.logger.warning(
+                            f"⚠️ Failed to resolve secret {secret_name} for {field_name}"
+                        )
+                        # Keep the reference as-is (will likely cause connection failure, but better than exposing the issue)
+
+            return {"success": True, "config": resolved_config}
+
+        except Exception as e:
+            self.logger.error(f"❌ Secret resolution error: {e}")
+            return {"success": False, "error": str(e)}
 
     async def execute_sql(self, query: str) -> Dict[str, Any]:
         """Execute raw SQL query directly against Supabase"""
@@ -376,3 +678,58 @@ class SupabaseDirectClient:
         except Exception as e:
             self.logger.error(f"❌ Supabase health check error: {e}")
             return {"success": False, "status": "error", "error": str(e)}
+
+    async def store_feedback(
+        self,
+        user_id: str,
+        channel_id: str,
+        feedback_text: str,
+        category: str,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Store user feedback in the feedback table"""
+        try:
+            url = f"{self.base_url}/rest/v1/feedback"
+
+            feedback_data = {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "feedback_text": feedback_text,
+                "category": category,
+                "metadata": metadata,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=feedback_data,
+                    headers=self._get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status in [200, 201]:
+                        result_data = await response.json()
+                        self.logger.info(
+                            f"✅ Feedback stored successfully for user {user_id}"
+                        )
+                        return {
+                            "success": True,
+                            "feedback_id": result_data[0].get("id")
+                            if result_data
+                            else "unknown",
+                            "data": result_data[0] if result_data else {},
+                        }
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(
+                            f"❌ Feedback storage failed: HTTP {response.status} - {error_text}"
+                        )
+                        return {
+                            "success": False,
+                            "error": f"HTTP {response.status}: {error_text}",
+                        }
+
+        except Exception as e:
+            self.logger.error(f"❌ Exception storing feedback: {e}")
+            return {"success": False, "error": str(e)}

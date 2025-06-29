@@ -51,7 +51,7 @@ mcp:
       args: ["-y", "@modelcontextprotocol/server-brave-search"]
 
     # n8n automation and workflow server via MCP endpoint
-    n8n:
+    Airtable:
       transport: "sse"
       url: "https://advertisingreportcard.app.n8n.cloud/mcp/gmail-enhanced/sse"
       description: "n8n workflow automation with Airtable integration"

@@ -324,16 +324,36 @@ class SlackMetaAgent:
             },
             "automation": {
                 "keywords": [
-                    "n8n",
                     "workflow",
                     "automate",
                     "trigger",
-                    "airtable",
                     "automation",
                     "zapier",
+                    "airtable workflow",
                 ],
                 "agent": "automation_specialist",
                 "confidence": 0.85,
+                "usage_count": 0,
+            },
+            "airtable": {
+                "keywords": [
+                    "airtable",
+                    "air table",
+                    "airtable base",
+                    "airtable records",
+                    "airtable data",
+                    "base id",
+                    "table records",
+                    "airtable api",
+                    "airtable database",
+                    "records in airtable",
+                    "update airtable",
+                    "create airtable",
+                    "delete airtable",
+                    "query airtable",
+                ],
+                "agent": "airtable_manager",
+                "confidence": 0.9,
                 "usage_count": 0,
             },
             "server_exploration": {
@@ -368,6 +388,29 @@ class SlackMetaAgent:
                 ],
                 "agent": "mcp_server_manager",
                 "confidence": 0.95,
+                "usage_count": 0,
+            },
+            "feedback": {
+                "keywords": [
+                    "feedback",
+                    "give feedback",
+                    "provide feedback",
+                    "share feedback",
+                    "i'd like to give feedback",
+                    "i want to give feedback",
+                    "here is feedback",
+                    "here's feedback",
+                    "my feedback",
+                    "feedback on",
+                    "suggestion",
+                    "improvement",
+                    "issue with",
+                    "problem with",
+                    "bug report",
+                    "feature request",
+                ],
+                "agent": "feedback_collector",
+                "confidence": 0.90,
                 "usage_count": 0,
             },
         }
@@ -932,7 +975,7 @@ class SlackMetaAgent:
                 - Managing Airtable record operations
                 - Data synchronization between platforms
                 - Automated data processing workflows""",
-                server_names=["n8n", "supabase", "fetch"],
+                server_names=["Airtable", "supabase", "fetch"],
                 capabilities=[
                     "workflow_automation",
                     "data_synchronization",
@@ -943,7 +986,7 @@ class SlackMetaAgent:
             "airtable_manager": AgentSpec(
                 name="airtable_manager",
                 instruction="""You are an Airtable database specialist with expertise in managing 
-                records, organizing data, and performing database operations through n8n workflows.
+                records, organizing data, and performing database operations through MCP servers.
                 
                 You can:
                 1. Create, read, update, and delete Airtable records
@@ -953,8 +996,8 @@ class SlackMetaAgent:
                 5. Generate reports from Airtable data
                 
                 Always ensure data integrity and follow best practices for database operations.
-                Use n8n workflows to interact with Airtable for complex operations.""",
-                server_names=["n8n", "fetch"],
+                Use the Airtable MCP server which provides both direct Airtable access and n8n workflow capabilities.""",
+                server_names=["Airtable", "fetch"],
                 capabilities=[
                     "airtable_operations",
                     "database_management",
@@ -1020,6 +1063,35 @@ class SlackMetaAgent:
                     "server_validation",
                     "database_management",
                     "configuration_management",
+                ],
+            ),
+            "feedback_collector": AgentSpec(
+                name="feedback_collector",
+                instruction="""You are a feedback collection specialist that helps users provide feedback, suggestions, and report issues.
+                
+                When users want to give feedback, you should:
+                1. Welcome their feedback warmly and professionally
+                2. If they just say they want to give feedback, ask them what their feedback is about
+                3. If they provide feedback directly, acknowledge it and collect it
+                4. Categorize feedback appropriately (general, bug_report, feature_request, improvement, etc.)
+                5. Store the feedback in the database with proper metadata
+                6. Thank them and let them know their feedback has been recorded
+                7. Ask if they have any additional feedback
+                
+                Types of feedback to handle:
+                - General feedback about the system
+                - Bug reports and issues
+                - Feature requests
+                - Suggestions for improvements
+                - User experience feedback
+                
+                Always be encouraging and make users feel heard. Their feedback is valuable for improving the system.""",
+                server_names=["supabase"],
+                capabilities=[
+                    "feedback_collection",
+                    "feedback_categorization",
+                    "database_storage",
+                    "user_interaction",
                 ],
             ),
         }
@@ -1513,10 +1585,10 @@ class SlackMetaAgent:
                 )
 
         # Extract specific service/tool names that might be in database
-        # Look for patterns like "airtable", "n8n", "webhook", etc.
+        # Look for patterns like "airtable", "workflow", "webhook", etc.
         service_patterns = [
             r"\b(airtable|air table)\b",
-            r"\b(n8n|n-8-n)\b",
+            r"\b(workflow|work flow)\b",
             r"\b(webhook|web hook)\b",
             r"\b(automation|automate)\b",
             r"\b(workflow|work flow)\b",
@@ -1602,179 +1674,552 @@ class SlackMetaAgent:
     async def _check_if_needs_dynamic_discovery(
         self, message: str, keywords: List[str]
     ) -> bool:
-        """Check if the message requires dynamic MCP server discovery"""
+        """Check if the message requires dynamic MCP server discovery using similarity scoring"""
         if not keywords:
             return False
 
-        # Check if any keywords suggest services that might be in database but not in current registry
-        message_lower = message.lower()
+        # 🎯 NEW APPROACH: Always find the best match using similarity scoring
+        # Compare both configured servers AND database servers to find the most specific match
 
-        # Patterns that suggest need for specialized tools/services
-        discovery_indicators = [
-            "mcp server",
-            "mcp tool",
-            "new service",
-            "connect to",
-            "integrate with",
-            "automation tool",
-            "workflow tool",
-            "api service",
-            "third party",
-            "external service",
+        self.logger.debug(f"🔍 Finding best server match for keywords: {keywords}")
+
+        # Get configured servers
+        configured_servers = []
+        if self.mcp_app and hasattr(self.mcp_app.context, "server_registry"):
+            configured_servers = list(
+                self.mcp_app.context.server_registry.registry.keys()
+            )
+
+        # Score configured servers
+        best_configured_match = self._score_server_matches(keywords, configured_servers)
+
+        # Get database servers (quick check to see if we should explore database)
+        potential_database_matches = self._estimate_database_match_potential(
+            keywords, message
+        )
+
+        self.logger.debug(f"🎯 Best configured match: {best_configured_match}")
+        self.logger.debug(f"🔍 Database match potential: {potential_database_matches}")
+
+        # Decision logic: Use dynamic discovery if database might have better matches
+        if best_configured_match and best_configured_match["score"] >= 0.8:
+            # High confidence configured match - but still check if database might be more specific
+            if (
+                potential_database_matches["specificity_score"]
+                > best_configured_match["score"]
+            ):
+                self.logger.info(
+                    f"🔍 Database might have more specific match than configured '{best_configured_match['server']}' (score: {best_configured_match['score']:.2f}) - exploring database"
+                )
+                return True
+            else:
+                self.logger.info(
+                    f"✅ Using configured server '{best_configured_match['server']}' (score: {best_configured_match['score']:.2f}) - skipping database search"
+                )
+                return False
+
+        elif best_configured_match and best_configured_match["score"] >= 0.5:
+            # Medium confidence configured match - check database for better options
+            if (
+                potential_database_matches["has_compound_keywords"]
+                or potential_database_matches["specificity_score"] > 0.7
+            ):
+                self.logger.info(
+                    f"🔍 Configured match '{best_configured_match['server']}' (score: {best_configured_match['score']:.2f}) might have better database alternatives"
+                )
+                return True
+            else:
+                self.logger.info(
+                    f"✅ Using configured server '{best_configured_match['server']}' (score: {best_configured_match['score']:.2f})"
+                )
+                return False
+
+        else:
+            # Low or no configured match - definitely check database
+            self.logger.info(
+                f"🔍 No strong configured match (best: {best_configured_match['score'] if best_configured_match else 0:.2f}) - checking database"
+            )
+            return True
+
+    def _score_server_matches(
+        self, keywords: List[str], servers: List[str]
+    ) -> Dict[str, Any]:
+        """Score how well keywords match available servers"""
+        if not servers or not keywords:
+            return None
+
+        best_match = None
+        best_score = 0.0
+
+        keywords_lower = [k.lower() for k in keywords]
+
+        for server in servers:
+            server_lower = server.lower()
+            score = 0.0
+
+            # Exact keyword match
+            for keyword in keywords_lower:
+                if keyword == server_lower:
+                    score += 1.0
+                elif keyword in server_lower:
+                    score += 0.8
+                elif server_lower in keyword:
+                    score += 0.6
+
+            # Compound keyword matching (e.g., "arc_airtable" vs ["arc", "airtable"])
+            if len(keywords_lower) > 1:
+                compound_match = all(k in server_lower for k in keywords_lower)
+                if compound_match:
+                    score += 1.5  # Bonus for compound matches
+
+            # Specificity bonus (longer, more specific server names get slight bonus)
+            if "_" in server_lower and len(keywords_lower) > 1:
+                score += 0.2
+
+            if score > best_score:
+                best_score = score
+                best_match = {
+                    "server": server,
+                    "score": score,
+                    "keywords_matched": keywords_lower,
+                }
+
+        return best_match
+
+    def _estimate_database_match_potential(
+        self, keywords: List[str], message: str
+    ) -> Dict[str, Any]:
+        """Estimate the potential for finding better matches in database"""
+        keywords_lower = [k.lower() for k in keywords]
+
+        # Check for compound keywords that suggest specific instances
+        compound_keywords = [k for k in keywords if "_" in k]
+
+        # Check for organization + service patterns
+        org_keywords = [
+            k for k in keywords if len(k) <= 10 and k.isupper() and len(k) >= 2
+        ]
+        service_keywords = [
+            k
+            for k in keywords
+            if k.lower() in ["airtable", "supabase", "workflow", "api", "webhook"]
         ]
 
-        # If message contains discovery indicators and service keywords, likely needs discovery
-        has_indicators = any(
-            indicator in message_lower for indicator in discovery_indicators
-        )
-        has_service_keywords = len(keywords) > 0
+        has_org_service_combo = len(org_keywords) > 0 and len(service_keywords) > 0
 
-        # Also check if keywords are NOT in current agent capabilities
-        current_capabilities = set()
-        for agent_spec in self.agent_registry.values():
-            current_capabilities.update(agent_spec.server_names)
+        # Calculate specificity score
+        specificity_score = 0.0
+        if compound_keywords:
+            specificity_score += 0.8
+        if has_org_service_combo:
+            specificity_score += 0.7
+        if len(keywords) > 1:
+            specificity_score += 0.3
 
-        unknown_services = [k for k in keywords if k not in current_capabilities]
-
-        return has_indicators or (has_service_keywords and len(unknown_services) > 0)
+        return {
+            "has_compound_keywords": len(compound_keywords) > 0,
+            "has_org_service_combo": has_org_service_combo,
+            "specificity_score": min(specificity_score, 1.0),
+            "compound_keywords": compound_keywords,
+            "org_keywords": org_keywords,
+            "service_keywords": service_keywords,
+        }
 
     async def _execute_dynamic_discovery_workflow(
         self, intent_analysis: Dict, message: str, agents: List[Agent]
     ) -> str:
-        """Execute the dynamic MCP server discovery workflow"""
+        """Execute the dynamic MCP server discovery workflow with best match selection"""
         try:
             keywords = intent_analysis.get("discovery_keywords", [])
-            self.logger.info(f"🔍 Starting dynamic discovery for keywords: {keywords}")
+            self.logger.info(f"🔍 Starting enhanced discovery for keywords: {keywords}")
 
-            # Step 1: Discover servers from database
-            discovered_servers = await self._dynamic_mcp_server_discovery(keywords)
+            # Step 1: Find best match from ALL sources (configured + database)
+            best_match = await self._find_best_server_match(keywords, message)
 
-            if not discovered_servers:
-                self.logger.info(
-                    f"💡 No specialized servers found for '{', '.join(keywords)}', offering exploration option"
-                )
-
-                # Offer MCP server exploration for unknown servers
+            if not best_match:
+                self.logger.info(f"💡 No server matches found, offering exploration")
                 exploration_offered = await self._offer_server_exploration(
                     keywords, message
                 )
                 if exploration_offered:
                     return exploration_offered
 
-                self.logger.info(f"💡 Checking if server exists in MCPApp registry")
-
-                # Check if any of the keywords match existing servers in MCPApp
-                existing_server_found = False
-                if self.mcp_app and hasattr(self.mcp_app.context, "server_registry"):
-                    available_servers = list(
-                        self.mcp_app.context.server_registry.keys()
-                    )
-                    self.logger.info(
-                        f"🔍 Available servers in MCPApp: {available_servers}"
-                    )
-
-                    # Check if any keyword matches an existing server
-                    for keyword in keywords:
-                        if keyword in available_servers:
-                            self.logger.info(
-                                f"✅ Found matching server '{keyword}' in MCPApp registry!"
-                            )
-                            # Try to use the existing server directly
-                            try:
-                                existing_agent = await self.get_pooled_agent(
-                                    "data_researcher",
-                                    f"existing_server_{int(datetime.now().timestamp())}",
-                                )
-                                async with existing_agent:
-                                    llm = await existing_agent.attach_llm(
-                                        OpenAIAugmentedLLM
-                                    )
-                                    enhanced_prompt = f"""
-                                    Original request: {message}
-                                    
-                                    You have access to the '{keyword}' MCP server which matches the user's request.
-                                    Use the appropriate tools from this server to fulfill the request.
-                                    
-                                    Focus on providing specific, actionable results with relevant data.
-                                    """
-                                    result = await llm.generate_str(enhanced_prompt)
-                                    existing_server_found = True
-                                    return result
-                            except Exception as e:
-                                self.logger.warning(
-                                    f"Failed to use existing server '{keyword}': {e}"
-                                )
-
-                if not existing_server_found:
-                    # Fall back to standard agents instead of returning an error message
-                    if agents:
-                        return await self._execute_sequential_fallback(message, agents)
-                    else:
-                        return f"⚠️ No specialized MCP servers found for '{', '.join(keywords)}' and no standard agents available."
-
-            # Step 2: Create dynamic agent with discovered servers
-            dynamic_agent = await self._create_dynamic_agent_with_servers(
-                discovered_servers, "discovery_agent"
-            )
-
-            if not dynamic_agent:
-                self.logger.warning(
-                    "❌ Failed to create dynamic agent, falling back to standard agents"
-                )
+                # Ultimate fallback to standard agents
                 if agents:
                     return await self._execute_sequential_fallback(message, agents)
                 else:
-                    return f"❌ Failed to create dynamic agent with discovered servers and no standard agents available."
+                    return f"⚠️ No MCP servers found for '{', '.join(keywords)}' and no standard agents available."
 
-            # Step 3: Execute request with dynamic agent
-            try:
-                async with dynamic_agent:
-                    llm = await dynamic_agent.attach_llm(OpenAIAugmentedLLM)
+            # Step 2: Use the best match found
+            if best_match["source"] == "configured":
+                self.logger.info(
+                    f"✅ Using configured server '{best_match['server_name']}' (score: {best_match['score']:.2f})"
+                )
+                return await self._use_configured_server(best_match, message, agents)
 
-                    enhanced_prompt = f"""
-                    Original request: {message}
-                    
-                    You have access to specialized MCP servers that were dynamically discovered:
-                    {[f"- {s['server_name']}: {s['description']}" for s in discovered_servers]}
-                    
-                    Use these specialized tools to fulfill the user's request. Focus on providing specific, 
-                    actionable results with relevant URLs, IDs, or identifiers where applicable.
-                    """
+            elif best_match["source"] == "database":
+                self.logger.info(
+                    f"✅ Using database server '{best_match['server_name']}' (score: {best_match['score']:.2f})"
+                )
+                return await self._use_database_server(best_match, message, agents)
 
-                    result = await llm.generate_str(enhanced_prompt)
-                    return result
-
-            finally:
-                # Clean up dynamic server registration if it exists
-                try:
-                    if (
-                        self.mcp_app
-                        and hasattr(self.mcp_app.context, "server_registry")
-                        and "dynamic_server"
-                        in self.mcp_app.context.server_registry.registry
-                    ):
-                        del self.mcp_app.context.server_registry.registry[
-                            "dynamic_server"
-                        ]
-                        self.logger.debug("🧹 Cleaned up dynamic server registration")
-                except Exception as cleanup_error:
-                    self.logger.warning(
-                        f"Dynamic server cleanup warning: {cleanup_error}"
-                    )
-
-                # Clean up dynamic agent
-                try:
-                    await dynamic_agent.__aexit__(None, None, None)
-                except:  # noqa: E722
-                    pass
+            else:
+                self.logger.warning(f"❌ Unknown server source: {best_match['source']}")
+                if agents:
+                    return await self._execute_sequential_fallback(message, agents)
+                else:
+                    return f"❌ Server match found but source unknown"
 
         except Exception as e:
-            self.logger.error(f"Dynamic discovery workflow error: {e}")
+            self.logger.error(f"Enhanced discovery workflow error: {e}")
             # Fallback to standard execution
             if agents:
                 return await self._execute_sequential_fallback(message, agents)
             else:
-                return f"❌ Dynamic discovery failed: {str(e)}"
+                return f"❌ Enhanced discovery failed: {str(e)}"
+
+    async def _find_best_server_match(
+        self, keywords: List[str], message: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find the best server match from both configured servers and database with user disambiguation"""
+
+        # Get configured servers and score them
+        configured_servers = []
+        if self.mcp_app and hasattr(self.mcp_app.context, "server_registry"):
+            configured_servers = list(
+                self.mcp_app.context.server_registry.registry.keys()
+            )
+
+        all_configured_matches = self._score_all_server_matches(
+            keywords, configured_servers, "configured"
+        )
+
+        # Get database servers and score them
+        discovered_servers = await self._dynamic_mcp_server_discovery(keywords)
+        database_server_names = (
+            [s["server_name"] for s in discovered_servers] if discovered_servers else []
+        )
+        all_database_matches = self._score_all_server_matches(
+            keywords, database_server_names, "database"
+        )
+
+        # Add server data to database matches
+        for match in all_database_matches:
+            match["server_data"] = next(
+                (
+                    s
+                    for s in discovered_servers
+                    if s["server_name"] == match["server_name"]
+                ),
+                None,
+            )
+
+        # Combine all candidates
+        all_candidates = all_configured_matches + all_database_matches
+
+        if not all_candidates:
+            return None
+
+        # Sort by score (highest first)
+        all_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # Check for ambiguity and ask user if needed
+        disambiguation_result = await self._handle_server_disambiguation(
+            all_candidates, keywords, message
+        )
+
+        if disambiguation_result:
+            self.logger.info(
+                f"🎯 User selected: {disambiguation_result['server_name']} (source: {disambiguation_result['source']}, score: {disambiguation_result['score']:.2f})"
+            )
+            return disambiguation_result
+
+        # If no disambiguation or user declined, return the best match
+        best_match = all_candidates[0]
+        self.logger.info(
+            f"🎯 Best match: {best_match['server_name']} (source: {best_match['source']}, score: {best_match['score']:.2f})"
+        )
+
+        return best_match
+
+    def _score_all_server_matches(
+        self, keywords: List[str], servers: List[str], source: str
+    ) -> List[Dict[str, Any]]:
+        """Score all servers and return all matches above threshold"""
+        if not servers or not keywords:
+            return []
+
+        matches = []
+        keywords_lower = [k.lower() for k in keywords]
+
+        for server in servers:
+            server_lower = server.lower()
+            score = 0.0
+
+            # Exact keyword match
+            for keyword in keywords_lower:
+                if keyword == server_lower:
+                    score += 1.0
+                elif keyword in server_lower:
+                    score += 0.8
+                elif server_lower in keyword:
+                    score += 0.6
+
+            # Compound keyword matching (e.g., "arc_airtable" vs ["arc", "airtable"])
+            if len(keywords_lower) > 1:
+                compound_match = all(k in server_lower for k in keywords_lower)
+                if compound_match:
+                    score += 1.5  # Bonus for compound matches
+
+            # Specificity bonus (longer, more specific server names get slight bonus)
+            if "_" in server_lower and len(keywords_lower) > 1:
+                score += 0.2
+
+            # Only include matches above a minimum threshold
+            if score >= 0.5:  # Minimum threshold for consideration
+                matches.append(
+                    {
+                        "source": source,
+                        "server_name": server,
+                        "score": score,
+                        "keywords_matched": keywords_lower,
+                        "server_data": None,  # Will be filled for database servers
+                    }
+                )
+
+        return matches
+
+    async def _handle_server_disambiguation(
+        self, candidates: List[Dict[str, Any]], keywords: List[str], message: str
+    ) -> Optional[Dict[str, Any]]:
+        """Handle cases where multiple servers could match - ask user to choose"""
+
+        # Disambiguation scenarios:
+        # 1. Best match has low confidence (< 0.8)
+        # 2. Multiple matches with similar scores (within 0.3 of each other)
+        # 3. More than 3 potential matches above threshold
+
+        best_score = candidates[0]["score"] if candidates else 0
+
+        # Check if we should ask user for disambiguation
+        should_disambiguate = False
+        reason = ""
+
+        if best_score < 0.8:
+            should_disambiguate = True
+            reason = f"low confidence (best score: {best_score:.2f})"
+
+        elif len(candidates) >= 2:
+            # Check if there are multiple similar matches
+            similar_matches = [c for c in candidates if c["score"] >= best_score - 0.3]
+            if len(similar_matches) >= 2:
+                should_disambiguate = True
+                reason = f"{len(similar_matches)} similar matches (within 0.3 points)"
+
+        elif len(candidates) > 3:
+            should_disambiguate = True
+            reason = f"many potential matches ({len(candidates)} found)"
+
+        if not should_disambiguate:
+            return None
+
+        self.logger.info(f"🤔 Asking user for disambiguation due to: {reason}")
+
+        # Limit to top 5 options to avoid overwhelming user
+        top_candidates = candidates[:5]
+
+        return await self._ask_user_to_choose_server(top_candidates, keywords, message)
+
+    async def _ask_user_to_choose_server(
+        self, candidates: List[Dict[str, Any]], keywords: List[str], message: str
+    ) -> Optional[Dict[str, Any]]:
+        """Present server options to user and get their choice"""
+
+        try:
+            from mcp_agent.human_input.types import HumanInputRequest
+
+            # Format the options for the user
+            options_text = (
+                "🤔 **I found multiple servers that might match your request:**\n\n"
+            )
+
+            for i, candidate in enumerate(candidates, 1):
+                source_emoji = "⚙️" if candidate["source"] == "configured" else "🗄️"
+                score_text = f"(match: {candidate['score']:.1f})"
+
+                server_description = ""
+                if candidate["source"] == "database" and candidate.get("server_data"):
+                    server_description = (
+                        f" - {candidate['server_data'].get('description', '')}"
+                    )
+
+                options_text += f"**{i}.** {source_emoji} `{candidate['server_name']}` {score_text}{server_description}\n"
+
+            options_text += f"\n**Original request:** {message[:100]}{'...' if len(message) > 100 else ''}"
+            options_text += f"\n**Keywords detected:** {', '.join(keywords)}"
+            options_text += "\n\n**Please reply with:**"
+            options_text += "\n• The **number** (1, 2, 3, etc.) of your choice"
+            options_text += "\n• The **server name** you want to use"
+            options_text += "\n• **'none'** if none of these are correct"
+            options_text += "\n• **'auto'** to let me pick the best one"
+
+            choice_request = HumanInputRequest(
+                request_id=f"server_choice_{int(datetime.now().timestamp())}",
+                prompt=options_text,
+                description="Choosing between multiple server options",
+            )
+
+            # Get user's choice
+            response = await self.slack_human_input_callback(choice_request)
+
+            if not response or not response.response.strip():
+                self.logger.info("❌ No server choice provided by user")
+                return None
+
+            user_choice = response.response.strip().lower()
+
+            # Parse user's choice
+            if user_choice in ["none", "skip", "cancel"]:
+                self.logger.info("❌ User declined all server options")
+                return None
+
+            elif user_choice in ["auto", "automatic", "best"]:
+                self.logger.info("✅ User chose automatic selection")
+                return candidates[0]  # Return the best match
+
+            # Try to parse as number
+            try:
+                choice_num = int(user_choice)
+                if 1 <= choice_num <= len(candidates):
+                    selected = candidates[choice_num - 1]
+                    self.logger.info(
+                        f"✅ User selected option {choice_num}: {selected['server_name']}"
+                    )
+                    return selected
+                else:
+                    self.logger.warning(f"⚠️ User choice {choice_num} out of range")
+                    return candidates[0]  # Fallback to best match
+            except ValueError:
+                # Try to match by server name
+                for candidate in candidates:
+                    if user_choice in candidate["server_name"].lower():
+                        self.logger.info(
+                            f"✅ User selected by name: {candidate['server_name']}"
+                        )
+                        return candidate
+
+                self.logger.warning(f"⚠️ Could not parse user choice: '{user_choice}'")
+                return candidates[0]  # Fallback to best match
+
+        except Exception as e:
+            self.logger.error(f"Error in server disambiguation: {e}")
+            return None  # Let the system pick automatically
+
+    async def _use_configured_server(
+        self, match: Dict[str, Any], message: str, agents: List[Agent]
+    ) -> str:
+        """Use a server from the configuration"""
+        server_name = match["server_name"]
+
+        try:
+            # Use an appropriate agent that has access to this server
+            agent_type = self._find_agent_for_server(server_name)
+            if not agent_type:
+                agent_type = "data_researcher"  # Fallback
+
+            agent = await self.get_pooled_agent(
+                agent_type, f"configured_server_{int(datetime.now().timestamp())}"
+            )
+
+            async with agent:
+                llm = await agent.attach_llm(OpenAIAugmentedLLM)
+                enhanced_prompt = f"""
+                Original request: {message}
+                
+                You have access to the '{server_name}' MCP server which matches the user's request.
+                Use the appropriate tools from this server to fulfill the request.
+                
+                Focus on providing specific, actionable results with relevant data.
+                """
+                result = await llm.generate_str(enhanced_prompt)
+                return result
+
+        except Exception as e:
+            self.logger.warning(f"Failed to use configured server '{server_name}': {e}")
+            if agents:
+                return await self._execute_sequential_fallback(message, agents)
+            else:
+                return f"❌ Failed to use configured server '{server_name}': {str(e)}"
+
+    async def _use_database_server(
+        self, match: Dict[str, Any], message: str, agents: List[Agent]
+    ) -> str:
+        """Use a server from the database"""
+        server_data = match["server_data"]
+
+        if not server_data:
+            self.logger.error("No server data available for database server")
+            if agents:
+                return await self._execute_sequential_fallback(message, agents)
+            else:
+                return "❌ Database server data missing"
+
+        # Create dynamic agent with the database server
+        dynamic_agent = await self._create_dynamic_agent_with_servers(
+            [server_data], "database_agent"
+        )
+
+        if not dynamic_agent:
+            self.logger.warning("❌ Failed to create dynamic agent for database server")
+            if agents:
+                return await self._execute_sequential_fallback(message, agents)
+            else:
+                return f"❌ Failed to create agent for database server '{server_data['server_name']}'"
+
+        try:
+            async with dynamic_agent:
+                llm = await dynamic_agent.attach_llm(OpenAIAugmentedLLM)
+
+                enhanced_prompt = f"""
+                Original request: {message}
+                
+                You have access to the specialized '{server_data["server_name"]}' MCP server:
+                - Description: {server_data.get("description", "Specialized server")}
+                - Transport: {server_data.get("transport", "unknown")}
+                
+                Use the tools from this server to fulfill the user's request. Focus on providing specific, 
+                actionable results with relevant data.
+                """
+
+                result = await llm.generate_str(enhanced_prompt)
+                return result
+
+        finally:
+            # Clean up dynamic server registration
+            try:
+                if (
+                    self.mcp_app
+                    and hasattr(self.mcp_app.context, "server_registry")
+                    and "dynamic_server"
+                    in self.mcp_app.context.server_registry.registry
+                ):
+                    del self.mcp_app.context.server_registry.registry["dynamic_server"]
+                    self.logger.debug("🧹 Cleaned up dynamic server registration")
+            except Exception as cleanup_error:
+                self.logger.warning(f"Dynamic server cleanup warning: {cleanup_error}")
+
+    def _find_agent_for_server(self, server_name: str) -> Optional[str]:
+        """Find which agent type can use the given server"""
+        server_lower = server_name.lower()
+
+        for agent_type, spec in self.agent_registry.items():
+            if server_name in spec.server_names:
+                return agent_type
+            # Also check case-insensitive
+            if any(s.lower() == server_lower for s in spec.server_names):
+                return agent_type
+
+        return None
 
     async def _offer_server_exploration(
         self, keywords: List[str], message: str
@@ -1935,14 +2380,14 @@ class SlackMetaAgent:
                         "url": self._guess_server_url(compound, "supabase"),
                     }
                 )
-            elif "n8n" in compound.lower():
+            elif "workflow" in compound.lower() or "automation" in compound.lower():
                 configs.append(
                     {
                         "server_name": compound,
                         "display_name": compound.replace("_", " ").title(),
-                        "description": f"Potential n8n workflow server: {compound}",
+                        "description": f"Potential workflow automation server: {compound}",
                         "transport": "sse",
-                        "url": self._guess_server_url(compound, "n8n"),
+                        "url": self._guess_server_url(compound, "workflow"),
                     }
                 )
 
@@ -1953,7 +2398,7 @@ class SlackMetaAgent:
         service_keywords = [
             k
             for k in keywords
-            if k.lower() in ["supabase", "airtable", "n8n", "api", "webhook"]
+            if k.lower() in ["supabase", "airtable", "api", "webhook", "workflow"]
         ]
 
         for org in org_keywords:
@@ -1983,7 +2428,7 @@ class SlackMetaAgent:
         if service_type == "supabase" and "arc" in server_name.lower():
             # Based on the pattern we discovered earlier
             return "https://advertisingreportcard.app.n8n.cloud/mcp/[workflow-id]/sse"
-        elif service_type == "n8n":
+        elif service_type == "workflow":
             return f"https://example.app.n8n.cloud/mcp/{server_name}/sse"
         else:
             return f"https://api.{server_name}.com/mcp/sse"
@@ -2341,7 +2786,7 @@ class SlackMetaAgent:
             - For capability questions, use "capability_inspector"
             - For factual questions (not requiring real-time data), use "knowledge_agent"
             - For weather/current events/real-time data, use "data_researcher"
-            - For airtable/n8n/automation, use "automation_specialist" or "airtable_manager"
+            - For airtable/workflow/automation, use "automation_specialist" or "airtable_manager"
             - For adding/registering/configuring MCP servers, use "mcp_server_manager"
             - Match the user's request to the actual tools available
             """
@@ -2510,6 +2955,16 @@ class SlackMetaAgent:
                 self.logger.info("🔧 Executing MCP server addition workflow")
                 user_id = getattr(self, "current_user_id", "unknown_user")
                 return await self.add_mcp_server_workflow(message, user_id)
+
+            # 💬 NEW: Handle feedback collection workflow
+            if (
+                len(agents) == 1
+                and hasattr(agents[0], "name")
+                and "feedback_collector" in agents[0].name
+            ) or intent_analysis.get("intent_name", "").startswith("dynamic_feedback"):
+                self.logger.info("💬 Executing feedback collection workflow")
+                user_id = getattr(self, "current_user_id", "unknown_user")
+                return await self.feedback_collection_workflow(message, user_id)
 
             # 🚀 NEW: Handle dynamic MCP discovery execution strategy
             if intent_analysis.get("execution_strategy") == "dynamic_discovery":
@@ -3524,9 +3979,9 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 "description": "Airtable MCP connection request",
             },
             {
-                "message": "trigger n8n workflow to update airtable",
+                "message": "trigger workflow to update airtable",
                 "expected_agent": "automation_specialist",
-                "description": "n8n workflow automation",
+                "description": "workflow automation via airtable server",
             },
         ]
 
@@ -3995,6 +4450,350 @@ The server is now available for use! You can reference it in future requests.
             self.logger.error(f"MCP server addition workflow error: {e}")
             return f"❌ Error adding MCP server: {str(e)}"
 
+    async def feedback_collection_workflow(
+        self, user_message: str, user_id: str
+    ) -> str:
+        """Handle the workflow for collecting user feedback"""
+        try:
+            self.logger.info(
+                f"💬 Starting feedback collection workflow for user {user_id}"
+            )
+
+            # Parse feedback from the message
+            feedback_info = self._parse_feedback_from_message(user_message)
+
+            if feedback_info["has_feedback"]:
+                # User provided feedback directly in their message
+                feedback_text = feedback_info["feedback_text"]
+                category = feedback_info["category"]
+
+                self.logger.info(
+                    f"📝 Direct feedback detected: {feedback_text[:50]}..."
+                )
+            else:
+                # User wants to give feedback but didn't provide it yet
+                from mcp_agent.human_input.types import HumanInputRequest
+
+                feedback_request = HumanInputRequest(
+                    request_id=f"feedback_{int(datetime.now().timestamp())}",
+                    prompt="💬 **Thanks for wanting to share feedback!**\n\nWhat would you like to tell us? This could be:\n• General feedback about the system\n• Bug reports or issues you've encountered\n• Feature requests or suggestions\n• Ideas for improvements\n\nPlease share your thoughts:",
+                    description="Collecting user feedback",
+                )
+
+                # Get feedback from user
+                response = await self.slack_human_input_callback(feedback_request)
+
+                if not response or not response.response.strip():
+                    return (
+                        "❌ No feedback provided. Feel free to share feedback anytime!"
+                    )
+
+                feedback_text = response.response.strip()
+                category = self._categorize_feedback(feedback_text)
+
+                self.logger.info(
+                    f"📝 Interactive feedback collected: {feedback_text[:50]}..."
+                )
+
+            # Store feedback in database
+            result = await self._store_feedback_in_database(
+                user_id=user_id,
+                channel_id=getattr(self, "current_channel_id", None),
+                feedback_text=feedback_text,
+                category=category,
+                metadata={
+                    "message_length": len(feedback_text),
+                    "collection_method": "direct"
+                    if feedback_info["has_feedback"]
+                    else "interactive",
+                    "original_message": user_message[:100]
+                    if len(user_message) < 100
+                    else user_message[:100] + "...",
+                },
+            )
+
+            if result["success"]:
+                return f"""✅ **Thank you for your feedback!**
+
+Your feedback has been recorded and will help us improve the system.
+
+**Feedback Summary:**
+• **Category:** {category.replace("_", " ").title()}
+• **Length:** {len(feedback_text)} characters
+• **Recorded:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+Is there anything else you'd like to share or any other feedback you have?"""
+            else:
+                return f"❌ Sorry, there was an issue recording your feedback: {result.get('error', 'Unknown error')}. Please try again."
+
+        except Exception as e:
+            self.logger.error(f"Feedback collection workflow error: {e}")
+            return f"❌ Error collecting feedback: {str(e)}"
+
+    def _parse_feedback_from_message(self, message: str) -> Dict[str, Any]:
+        """Parse feedback information from the user's message"""
+        import re
+
+        message_lower = message.lower().strip()
+
+        # Patterns that indicate the user is providing feedback directly
+        direct_feedback_patterns = [
+            r"here\s+is\s+feedback[:\s]*(.+)",
+            r"here's\s+feedback[:\s]*(.+)",
+            r"my\s+feedback\s+is[:\s]*(.+)",
+            r"feedback[:\s]*(.+)",
+            r"i\s+think\s+(.+)",
+            r"suggestion[:\s]*(.+)",
+            r"improvement[:\s]*(.+)",
+            r"issue\s+with[:\s]*(.+)",
+            r"problem\s+with[:\s]*(.+)",
+            r"bug\s+report[:\s]*(.+)",
+            r"feature\s+request[:\s]*(.+)",
+        ]
+
+        # Patterns that indicate user wants to give feedback but hasn't provided it yet
+        intent_only_patterns = [
+            r"i'd?\s+like\s+to\s+give\s+feedback",
+            r"i\s+want\s+to\s+give\s+feedback",
+            r"give\s+feedback",
+            r"provide\s+feedback",
+            r"share\s+feedback",
+            r"can\s+i\s+give\s+feedback",
+            r"how\s+do\s+i\s+give\s+feedback",
+        ]
+
+        feedback_info = {
+            "has_feedback": False,
+            "feedback_text": "",
+            "category": "general",
+        }
+
+        # Check for direct feedback first
+        for pattern in direct_feedback_patterns:
+            match = re.search(pattern, message_lower, re.IGNORECASE | re.DOTALL)
+            if match:
+                feedback_text = match.group(1).strip()
+                if len(feedback_text) > 10:  # Ensure it's substantial feedback
+                    feedback_info["has_feedback"] = True
+                    feedback_info["feedback_text"] = feedback_text
+                    feedback_info["category"] = self._categorize_feedback(feedback_text)
+                    self.logger.info(
+                        f"📝 Direct feedback parsed: {feedback_text[:30]}..."
+                    )
+                    return feedback_info
+
+        # If no direct feedback found, check if they want to give feedback
+        for pattern in intent_only_patterns:
+            if re.search(pattern, message_lower):
+                feedback_info["has_feedback"] = False
+                self.logger.info(
+                    "💭 User wants to give feedback but hasn't provided it yet"
+                )
+                return feedback_info
+
+        # If message contains feedback keywords but no clear pattern, treat as direct feedback
+        feedback_keywords = [
+            "feedback",
+            "suggestion",
+            "improvement",
+            "issue",
+            "problem",
+            "bug",
+            "feature",
+        ]
+        if (
+            any(keyword in message_lower for keyword in feedback_keywords)
+            and len(message.strip()) > 20
+        ):
+            feedback_info["has_feedback"] = True
+            feedback_info["feedback_text"] = message.strip()
+            feedback_info["category"] = self._categorize_feedback(message)
+            self.logger.info(f"📝 Implicit feedback detected: {message[:30]}...")
+
+        return feedback_info
+
+    def _categorize_feedback(self, feedback_text: str) -> str:
+        """Automatically categorize feedback based on content"""
+        feedback_lower = feedback_text.lower()
+
+        # Bug reports
+        if any(
+            word in feedback_lower
+            for word in [
+                "bug",
+                "error",
+                "broken",
+                "crash",
+                "not working",
+                "issue",
+                "problem",
+            ]
+        ):
+            return "bug_report"
+
+        # Feature requests
+        if any(
+            word in feedback_lower
+            for word in [
+                "feature",
+                "add",
+                "new",
+                "would like",
+                "wish",
+                "could you",
+                "request",
+            ]
+        ):
+            return "feature_request"
+
+        # Improvements
+        if any(
+            word in feedback_lower
+            for word in [
+                "improve",
+                "better",
+                "enhance",
+                "upgrade",
+                "optimize",
+                "suggestion",
+            ]
+        ):
+            return "improvement"
+
+        # Performance issues
+        if any(
+            word in feedback_lower
+            for word in ["slow", "fast", "performance", "speed", "lag", "delay"]
+        ):
+            return "performance"
+
+        # User experience
+        if any(
+            word in feedback_lower
+            for word in [
+                "confusing",
+                "unclear",
+                "difficult",
+                "easy",
+                "user",
+                "interface",
+                "ux",
+            ]
+        ):
+            return "user_experience"
+
+        # Positive feedback
+        if any(
+            word in feedback_lower
+            for word in [
+                "good",
+                "great",
+                "love",
+                "excellent",
+                "awesome",
+                "thank",
+                "helpful",
+            ]
+        ):
+            return "positive"
+
+        # Default to general
+        return "general"
+
+    async def _store_feedback_in_database(
+        self,
+        user_id: str,
+        channel_id: str,
+        feedback_text: str,
+        category: str,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Store feedback in the database"""
+        try:
+            # Try direct Supabase client first for reliability
+            if self.supabase_direct_client:
+                result = await self.supabase_direct_client.store_feedback(
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    feedback_text=feedback_text,
+                    category=category,
+                    metadata=metadata,
+                )
+                if result["success"]:
+                    self.logger.info(
+                        f"✅ Stored feedback for user {user_id} via direct client"
+                    )
+                    return result
+                else:
+                    self.logger.warning(
+                        f"⚠️ Direct feedback storage failed: {result['error']}, falling back to MCP"
+                    )
+
+            # Fallback to MCP method
+            self.logger.info("🔄 Falling back to MCP-based feedback storage")
+
+            # Create agent for database operations
+            db_agent = Agent(
+                name="feedback_db_manager",
+                instruction="Execute SQL operations for feedback storage",
+                server_names=["supabase"],
+                context=self.mcp_app.context if self.mcp_app else None,
+            )
+
+            async with db_agent:
+                llm = await db_agent.attach_llm(OpenAIAugmentedLLM)
+
+                # Prepare data with proper escaping
+                escaped_feedback = feedback_text.replace("'", "''")
+                escaped_category = category.replace("'", "''")
+                metadata_json = json.dumps(metadata).replace("'", "''")
+
+                insert_prompt = f"""Execute this SQL to store the user feedback:
+
+Project ID: {self.supabase_project_id}
+
+INSERT INTO feedback (
+    user_id, 
+    channel_id, 
+    feedback_text, 
+    category, 
+    metadata, 
+    created_at
+) VALUES (
+    '{user_id}', 
+    {f"'{channel_id}'" if channel_id else "NULL"}, 
+    '{escaped_feedback}', 
+    '{escaped_category}', 
+    '{metadata_json}'::jsonb, 
+    NOW()
+) RETURNING id, created_at;
+
+Use the execute_sql tool to run this query."""
+
+                result = await llm.generate_str(insert_prompt)
+                self.logger.info(f"✅ Feedback storage result: {result}")
+
+                # Check if the operation was successful
+                if "INSERT" in result or "id" in result.lower():
+                    return {
+                        "success": True,
+                        "message": f"✅ Feedback stored successfully for user {user_id}",
+                        "details": result,
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Could not verify feedback was stored: {result}",
+                        "details": result,
+                    }
+
+        except Exception as e:
+            self.logger.error(f"❌ Feedback storage error: {e}")
+            import traceback
+
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            return {"success": False, "error": str(e)}
+
     def _parse_server_info_from_message(self, message: str) -> Dict[str, Any]:
         """Parse any server information from the user's initial message"""
         import re
@@ -4086,6 +4885,16 @@ The server is now available for use! You can reference it in future requests.
                         return None
                     server_info["url"] = url_response.strip()
 
+                # 🔐 NEW: Check for authentication requirements
+                auth_response = await self._ask_user_for_info(
+                    f"Does this server require authentication? (API key, token, etc.)\n\n**Reply 'yes' if it needs credentials, or 'no' if it's public**",
+                    user_id,
+                )
+
+                if auth_response and auth_response.lower().startswith("y"):
+                    # Gather authentication details
+                    await self._gather_authentication_details(server_info, user_id)
+
             elif transport == "stdio":
                 if "command" not in server_info or not server_info["command"]:
                     cmd_response = await self._ask_user_for_info(
@@ -4113,6 +4922,16 @@ The server is now available for use! You can reference it in future requests.
                     server_info["args"] = args_response.strip().split()
                 else:
                     server_info["args"] = []
+
+                # 🔐 NEW: Check for environment variables (including secrets)
+                env_response = await self._ask_user_for_info(
+                    "Does this server need environment variables? (API keys, tokens, etc.)\n\n**Reply 'yes' if it needs env vars, or 'no' if none needed**",
+                    user_id,
+                )
+
+                if env_response and env_response.lower().startswith("y"):
+                    await self._gather_environment_variables(server_info, user_id)
+
             else:
                 return None  # Invalid transport type
 
@@ -4120,19 +4939,38 @@ The server is now available for use! You can reference it in future requests.
             if "args" not in server_info:
                 server_info["args"] = []
 
-            # Show summary and confirm
+            # Show summary and confirm (mask sensitive data in summary)
+            masked_server_info = self._mask_sensitive_data(server_info)
             summary = f"""**MCP Server Configuration Summary:**
-• **Name:** {server_info["server_name"]}
-• **Display Name:** {server_info["display_name"]}
-• **Description:** {server_info["description"]}
-• **Transport:** {server_info["transport"]}"""
+• **Name:** {masked_server_info["server_name"]}
+• **Display Name:** {masked_server_info["display_name"]}
+• **Description:** {masked_server_info["description"]}
+• **Transport:** {masked_server_info["transport"]}"""
 
-            if server_info.get("url"):
-                summary += f"\n• **URL:** {server_info['url']}"
-            if server_info.get("command"):
-                summary += f"\n• **Command:** {server_info['command']}"
-            if server_info.get("args"):
-                summary += f"\n• **Arguments:** {' '.join(server_info['args'])}"
+            if masked_server_info.get("url"):
+                summary += f"\n• **URL:** {masked_server_info['url']}"
+            if masked_server_info.get("command"):
+                summary += f"\n• **Command:** {masked_server_info['command']}"
+            if masked_server_info.get("args"):
+                summary += f"\n• **Arguments:** {' '.join(masked_server_info['args'])}"
+
+            # Show authentication fields (masked)
+            auth_fields = [
+                k
+                for k in masked_server_info.keys()
+                if k
+                not in [
+                    "server_name",
+                    "display_name",
+                    "description",
+                    "transport",
+                    "url",
+                    "command",
+                    "args",
+                ]
+            ]
+            if auth_fields:
+                summary += f"\n• **Authentication:** {len(auth_fields)} credential(s) configured 🔐"
 
             summary += "\n\nDoes this look correct? Reply **yes** to add the server or **no** to cancel."
 
@@ -4146,6 +4984,125 @@ The server is now available for use! You can reference it in future requests.
         except Exception as e:
             self.logger.error(f"Error gathering server information: {e}")
             return None
+
+    async def _gather_authentication_details(
+        self, server_info: Dict[str, Any], user_id: str
+    ):
+        """Gather authentication details for the server"""
+        try:
+            auth_type_response = await self._ask_user_for_info(
+                """What type of authentication does this server use?
+
+**Common options:**
+• **api_key** - API Key in headers
+• **bearer_token** - Bearer token in headers
+• **basic_auth** - Username/password
+• **custom** - Custom authentication
+
+**Please specify the type:**""",
+                user_id,
+            )
+
+            if not auth_type_response:
+                return
+
+            auth_type = auth_type_response.strip().lower()
+
+            if auth_type in ["api_key", "apikey", "api-key"]:
+                api_key = await self._ask_user_for_info(
+                    "🔐 **Please provide your API key:**\n\n⚠️ This will be stored securely in Supabase secrets manager, not in plain text.",
+                    user_id,
+                )
+                if api_key:
+                    server_info["api_key"] = api_key.strip()
+
+            elif auth_type in ["bearer_token", "bearer", "token"]:
+                token = await self._ask_user_for_info(
+                    "🔐 **Please provide your bearer token:**\n\n⚠️ This will be stored securely in Supabase secrets manager, not in plain text.",
+                    user_id,
+                )
+                if token:
+                    server_info["bearer_token"] = token.strip()
+
+            elif auth_type in ["basic_auth", "basic"]:
+                username = await self._ask_user_for_info(
+                    "What's the username for basic auth?",
+                    user_id,
+                )
+                password = await self._ask_user_for_info(
+                    "🔐 **What's the password for basic auth?**\n\n⚠️ This will be stored securely in Supabase secrets manager, not in plain text.",
+                    user_id,
+                )
+                if username and password:
+                    server_info["auth_username"] = username.strip()
+                    server_info["auth_password"] = password.strip()
+
+            elif auth_type == "custom":
+                # Allow custom field names
+                field_name = await self._ask_user_for_info(
+                    "What should we call this credential field? (e.g., 'webhook_secret', 'signing_key', etc.)",
+                    user_id,
+                )
+                if field_name:
+                    credential_value = await self._ask_user_for_info(
+                        f"🔐 **Please provide the value for {field_name}:**\n\n⚠️ This will be stored securely in Supabase secrets manager, not in plain text.",
+                        user_id,
+                    )
+                    if credential_value:
+                        server_info[field_name.strip()] = credential_value.strip()
+
+        except Exception as e:
+            self.logger.error(f"Error gathering authentication details: {e}")
+
+    async def _gather_environment_variables(
+        self, server_info: Dict[str, Any], user_id: str
+    ):
+        """Gather environment variables for stdio servers"""
+        try:
+            while True:
+                env_name = await self._ask_user_for_info(
+                    "What's the name of the environment variable? (e.g., 'API_KEY', 'DATABASE_URL')\n\n**Type 'done' when finished adding variables:**",
+                    user_id,
+                )
+
+                if not env_name or env_name.lower() in ["done", "finished", "exit"]:
+                    break
+
+                env_value = await self._ask_user_for_info(
+                    f"🔐 **What's the value for {env_name}?**\n\n⚠️ If this is sensitive (API key, password, etc.), it will be stored securely in Supabase secrets manager.",
+                    user_id,
+                )
+
+                if env_value:
+                    # Store with env_ prefix to distinguish from direct server fields
+                    server_info[f"env_{env_name.strip()}"] = env_value.strip()
+
+        except Exception as e:
+            self.logger.error(f"Error gathering environment variables: {e}")
+
+    def _mask_sensitive_data(self, server_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a masked version of server info for display purposes"""
+        masked_info = server_info.copy()
+
+        for field_name, field_value in server_info.items():
+            if (
+                isinstance(field_value, str)
+                and self.supabase_direct_client
+                and self.supabase_direct_client._is_secret_field(
+                    field_name, field_value
+                )
+            ):
+                # Mask sensitive values for display
+                if len(field_value) > 8:
+                    masked_info[field_name] = (
+                        field_value[:4]
+                        + "*" * (len(field_value) - 8)
+                        + field_value[-4:]
+                    )
+                else:
+                    masked_info[field_name] = "*" * len(field_value)
+
+        return masked_info
 
     async def _ask_user_for_info(self, prompt: str, user_id: str) -> Optional[str]:
         """Ask the user for information using the Slack human input system"""
@@ -4168,20 +5125,22 @@ The server is now available for use! You can reference it in future requests.
     async def _add_server_to_database(
         self, server_info: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Add the MCP server configuration to the Supabase database using direct client"""
+        """Add the MCP server configuration to the Supabase database with secure secrets handling"""
         try:
-            # Use direct Supabase client if available
+            # 🔐 Use secure insertion method if direct client is available
             if self.supabase_direct_client:
                 self.logger.info(
-                    "🚀 Using direct Supabase client for reliable server addition"
+                    "🔐 Using secure MCP server insertion with secrets management"
                 )
 
-                # Add the server directly
-                result = await self.supabase_direct_client.insert_mcp_server(
+                # Use the new secure insertion method
+                result = await self.supabase_direct_client.insert_mcp_server_secure(
                     server_info
                 )
 
                 if result["success"]:
+                    secret_count = len(result.get("secret_references", {}))
+
                     # Verify the server was added
                     verify_result = (
                         await self.supabase_direct_client.verify_server_exists(
@@ -4193,7 +5152,8 @@ The server is now available for use! You can reference it in future requests.
                         return {
                             "success": True,
                             "server_id": result.get("server_id", "unknown"),
-                            "message": f"✅ Server '{server_info['server_name']}' added successfully via direct client",
+                            "message": f"✅ Server '{server_info['server_name']}' added successfully with {secret_count} secrets secured",
+                            "secret_references": result.get("secret_references", {}),
                             "details": verify_result["data"],
                         }
                     else:
@@ -4204,9 +5164,9 @@ The server is now available for use! You can reference it in future requests.
                         }
                 else:
                     self.logger.warning(
-                        f"⚠️ Direct client failed: {result['error']}, falling back to MCP method"
+                        f"⚠️ Secure insertion failed: {result['error']}, falling back to standard method"
                     )
-                    # Fall through to MCP method
+                    # Fall through to standard MCP method
 
             # Fallback to MCP method if direct client is unavailable or failed
             self.logger.info("🔄 Falling back to MCP-based server addition")
@@ -4237,7 +5197,7 @@ The server is now available for use! You can reference it in future requests.
                 config_result = await llm.generate_str(config_prompt)
                 self.logger.info(f"✅ Configuration result: {config_result}")
 
-                # Step 2: Insert the server
+                # Step 2: Prepare server data (warn about potential security issues)
                 server_name = server_info["server_name"].replace("'", "''")
                 display_name = server_info.get("display_name", server_name).replace(
                     "'", "''"
@@ -4254,6 +5214,32 @@ The server is now available for use! You can reference it in future requests.
                     if server_info.get("command")
                     else None
                 )
+
+                # ⚠️ WARNING: In fallback mode, secrets will be stored in plain text
+                # This should only happen if direct client fails
+                sensitive_fields = []
+                for field_name, field_value in server_info.items():
+                    if (
+                        field_name
+                        not in [
+                            "server_name",
+                            "display_name",
+                            "description",
+                            "transport",
+                            "url",
+                            "command",
+                            "args",
+                        ]
+                        and isinstance(field_value, str)
+                        and len(field_value) > 0
+                    ):
+                        sensitive_fields.append(field_name)
+
+                if sensitive_fields:
+                    self.logger.warning(
+                        f"⚠️ SECURITY WARNING: Storing {len(sensitive_fields)} potentially sensitive fields in plain text: {sensitive_fields}"
+                    )
+
                 args = json.dumps(server_info.get("args", [])).replace("'", "''")
 
                 server_prompt = f"""Execute this SQL to add the MCP server:
@@ -4316,11 +5302,16 @@ The server is now available for use! You can reference it in future requests.
                     isinstance(verify_result, str)
                     and server_name.lower() in verify_result.lower()
                 ):
+                    warning_message = ""
+                    if sensitive_fields:
+                        warning_message = f" ⚠️ WARNING: {len(sensitive_fields)} sensitive field(s) stored in plain text"
+
                     return {
                         "success": True,
                         "server_id": "added_successfully",
-                        "message": f"✅ Server '{server_name}' added to database successfully via MCP",
+                        "message": f"✅ Server '{server_name}' added to database successfully via MCP{warning_message}",
                         "details": verify_result,
+                        "security_warning": bool(sensitive_fields),
                     }
                 else:
                     return {
