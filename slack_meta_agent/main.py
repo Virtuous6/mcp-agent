@@ -1159,49 +1159,333 @@ class SlackMetaAgent:
         return best_match
 
     def _update_pattern_learning(self, message: str, agent_used: str, success: bool):
-        """Update pattern matching and persist learning"""
-        message_lower = message.lower()
+        """Update learning patterns based on interaction success"""
+        message_words = set(message.lower().split())
 
-        # Find which pattern should have matched
-        for pattern_name, pattern_info in self.dynamic_patterns.items():
-            if pattern_info["agent"] == agent_used:
-                # Check if any keywords matched
-                keyword_matches = [
-                    kw for kw in pattern_info["keywords"] if kw in message_lower
-                ]
+        # Initialize agent entry if it doesn't exist
+        if agent_used not in self.pattern_learning:
+            self.pattern_learning[agent_used] = {"successful_keywords": set()}
 
-                if keyword_matches and success:
-                    # Boost confidence for successful matches
-                    old_confidence = pattern_info["confidence"]
-                    pattern_info["confidence"] = min(0.95, old_confidence + 0.01)
-                    pattern_info["usage_count"] += 1
+        # Track successful keywords
+        if success:
+            for word in message_words:
+                if len(word) > 3:  # Ignore short words
+                    self.pattern_learning[agent_used]["successful_keywords"].add(word)
 
-                    self.logger.debug(
-                        f"📈 Boosted {pattern_name} confidence: {old_confidence:.3f} -> {pattern_info['confidence']:.3f}"
-                    )
-
-                elif (
-                    not keyword_matches
-                    and success
-                    and len(pattern_info["keywords"]) < 15
-                ):
-                    # Learn new keywords from successful requests (limit growth)
-                    words = message_lower.split()
-                    for word in words:
-                        if (
-                            len(word) > 3
-                            and word not in pattern_info["keywords"]
-                            and word.isalpha()
-                        ):  # Only alphabetic words
-                            pattern_info["keywords"].append(word)
-                            pattern_info["usage_count"] += 1
-                            self.logger.info(
-                                f"📚 Learned new keyword '{word}' for {pattern_name}"
-                            )
-                            break  # Only add one new keyword per successful interaction
+                    # Also check if we should add compound keywords (simple heuristic)
+                    # Look for action + object patterns
+                    if word in ["create", "build", "generate", "make", "show", "get"]:
+                        for potential_object in message_words:
+                            if (
+                                potential_object
+                                in [
+                                    "dashboard",
+                                    "report",
+                                    "analysis",
+                                    "weather",
+                                    "data",
+                                    "file",
+                                    "code",
+                                ]
+                                and potential_object != word
+                            ):
+                                compound_keyword = f"{word}_{potential_object}"
+                                self.pattern_learning[agent_used][
+                                    "successful_keywords"
+                                ].add(compound_keyword)
+                                self.logger.debug(
+                                    f"📚 Added compound keyword: {compound_keyword} -> {agent_used}"
+                                )
+                                break  # Only add one new keyword per successful interaction
 
         # Persist learning after updates
         self._save_learning_patterns()
+
+    def _extract_discovery_keywords_from_message(self, message: str) -> List[str]:
+        """Extract keywords from message that might indicate need for dynamic MCP server discovery"""
+        import re
+
+        message_lower = message.lower()
+        keywords = []
+
+        # 🎯 PRIORITY: Extract organization-specific qualifiers (like "ARC supabase")
+        # Look for patterns like "our [ORG] [service]" or "[ORG] [service]"
+        org_service_patterns = [
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(supabase|database|db)\b",  # "our ARC supabase", "ARC supabase"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(airtable|air table)\b",  # "our ACME airtable"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(n8n|automation)\b",  # "our CORP n8n"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(api|webhook|integration)\b",  # "our ORG api"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(server|service)\b",  # "our ARC server"
+        ]
+
+        for pattern in org_service_patterns:
+            matches = re.findall(pattern, message, re.IGNORECASE)
+            for match in matches:
+                org_name = match[0].upper()  # Organization name (e.g., "ARC")
+                service_type = match[1].lower()  # Service type (e.g., "supabase")
+
+                # Add both individual keywords and compound qualifier
+                keywords.extend([org_name.lower(), service_type])
+                keywords.append(
+                    f"{org_name.lower()}_{service_type}"
+                )  # e.g., "arc_supabase"
+
+                self.logger.info(
+                    f"🎯 Extracted qualified service: {org_name} {service_type}"
+                )
+
+        # Extract specific service/tool names that might be in database
+        # Look for patterns like "airtable", "n8n", "webhook", etc.
+        service_patterns = [
+            r"\b(airtable|air table)\b",
+            r"\b(n8n|n-8-n)\b",
+            r"\b(webhook|web hook)\b",
+            r"\b(automation|automate)\b",
+            r"\b(workflow|work flow)\b",
+            r"\b(integration|integrate)\b",
+            r"\b(zapier)\b",
+            r"\b(sync|synchronize)\b",
+            r"\b(trigger)\b",
+            r"\b(gmail|email)\b",
+            r"\b(calendar)\b",
+            r"\b(notion)\b",
+            r"\b(slack)\b",
+            r"\b(discord)\b",
+            r"\b(teams)\b",
+            r"\b(api)\b",
+            r"\b(database|db|supabase)\b",  # Include supabase here too
+            r"\b(crm)\b",
+            r"\b(analytics)\b",
+        ]
+
+        for pattern in service_patterns:
+            matches = re.findall(pattern, message_lower)
+            keywords.extend(matches)
+
+        # Extract organization names (capitalized words that might be org identifiers)
+        # Look for 2-10 character all-caps words that could be organization codes
+        org_patterns = [
+            r"\b([A-Z]{2,10})\b",  # All caps words like "ARC", "ACME", "CORP"
+        ]
+
+        for pattern in org_patterns:
+            matches = re.findall(pattern, message)
+            for match in matches:
+                # Only add if it's not a common English word
+                if match.lower() not in [
+                    "THE",
+                    "AND",
+                    "FOR",
+                    "ARE",
+                    "BUT",
+                    "NOT",
+                    "YOU",
+                    "ALL",
+                    "CAN",
+                    "HAD",
+                    "HER",
+                    "WAS",
+                    "ONE",
+                    "OUR",
+                    "OUT",
+                    "DAY",
+                    "GET",
+                    "USE",
+                    "MAN",
+                    "NEW",
+                    "NOW",
+                    "OLD",
+                    "SEE",
+                    "HIM",
+                    "TWO",
+                    "HOW",
+                    "ITS",
+                    "DID",
+                    "YES",
+                    "WHO",
+                    "OIL",
+                    "SIT",
+                    "SET",
+                ]:
+                    keywords.append(match.lower())
+
+        # Also extract quoted service names or capitalized words that might be service names
+        quoted_matches = re.findall(r'"([^"]+)"', message)
+        keywords.extend([match.lower() for match in quoted_matches])
+
+        # Remove duplicates while preserving order
+        unique_keywords = []
+        for keyword in keywords:
+            if keyword not in unique_keywords:
+                unique_keywords.append(keyword)
+
+        return unique_keywords
+
+    async def _check_if_needs_dynamic_discovery(
+        self, message: str, keywords: List[str]
+    ) -> bool:
+        """Check if the message requires dynamic MCP server discovery"""
+        if not keywords:
+            return False
+
+        # Check if any keywords suggest services that might be in database but not in current registry
+        message_lower = message.lower()
+
+        # Patterns that suggest need for specialized tools/services
+        discovery_indicators = [
+            "mcp server",
+            "mcp tool",
+            "new service",
+            "connect to",
+            "integrate with",
+            "automation tool",
+            "workflow tool",
+            "api service",
+            "third party",
+            "external service",
+        ]
+
+        # If message contains discovery indicators and service keywords, likely needs discovery
+        has_indicators = any(
+            indicator in message_lower for indicator in discovery_indicators
+        )
+        has_service_keywords = len(keywords) > 0
+
+        # Also check if keywords are NOT in current agent capabilities
+        current_capabilities = set()
+        for agent_spec in self.agent_registry.values():
+            current_capabilities.update(agent_spec.server_names)
+
+        unknown_services = [k for k in keywords if k not in current_capabilities]
+
+        return has_indicators or (has_service_keywords and len(unknown_services) > 0)
+
+    async def _execute_dynamic_discovery_workflow(
+        self, intent_analysis: Dict, message: str, agents: List[Agent]
+    ) -> str:
+        """Execute the dynamic MCP server discovery workflow"""
+        try:
+            keywords = intent_analysis.get("discovery_keywords", [])
+            self.logger.info(f"🔍 Starting dynamic discovery for keywords: {keywords}")
+
+            # Step 1: Discover servers from database
+            discovered_servers = await self._dynamic_mcp_server_discovery(keywords)
+
+            if not discovered_servers:
+                return f"⚠️ No specialized MCP servers found for '{', '.join(keywords)}'. Using standard agents."
+
+            # Step 2: Create dynamic agent with discovered servers
+            dynamic_agent = await self._create_dynamic_agent_with_servers(
+                discovered_servers, "discovery_agent"
+            )
+
+            if not dynamic_agent:
+                return f"❌ Failed to create dynamic agent with discovered servers."
+
+            # Step 3: Execute request with dynamic agent
+            try:
+                async with dynamic_agent:
+                    llm = await dynamic_agent.attach_llm(OpenAIAugmentedLLM)
+
+                    enhanced_prompt = f"""
+                    Original request: {message}
+                    
+                    You have access to specialized MCP servers that were dynamically discovered:
+                    {[f"- {s['server_name']}: {s['description']}" for s in discovered_servers]}
+                    
+                    Use these specialized tools to fulfill the user's request. Focus on providing specific, 
+                    actionable results with relevant URLs, IDs, or identifiers where applicable.
+                    """
+
+                    result = await llm.generate_str(enhanced_prompt)
+                    return result
+
+            finally:
+                # Clean up dynamic agent
+                try:
+                    await dynamic_agent.__aexit__(None, None, None)
+                except:  # noqa: E722
+                    pass
+
+        except Exception as e:
+            self.logger.error(f"Dynamic discovery workflow error: {e}")
+            # Fallback to standard execution
+            if agents:
+                return await self._execute_sequential_fallback(message, agents)
+            else:
+                return f"❌ Dynamic discovery failed: {str(e)}"
+
+    def _parse_mcp_query_result(self, query_result: str) -> List[Dict]:
+        """Parse the result from MCP server database query into server configurations"""
+        import re
+        import json
+
+        servers = []
+
+        try:
+            # Try to extract JSON from the result if it contains structured data
+            json_matches = re.findall(r"\{[^{}]*\}", query_result)
+
+            for json_str in json_matches:
+                try:
+                    server_data = json.loads(json_str)
+                    if isinstance(server_data, dict) and "server_name" in server_data:
+                        servers.append(server_data)
+                except json.JSONDecodeError:
+                    continue
+
+            # If no JSON found, try to parse from structured text
+            if not servers:
+                # Look for patterns like "server_name: value"
+                lines = query_result.split("\n")
+                current_server = {}
+
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        if current_server and "server_name" in current_server:
+                            servers.append(current_server)
+                            current_server = {}
+                        continue
+
+                    # Parse key: value pairs
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        key = key.strip().lower()
+                        value = value.strip().strip("\"'")
+
+                        if key in [
+                            "server_name",
+                            "display_name",
+                            "description",
+                            "transport",
+                            "url",
+                            "command",
+                        ]:
+                            current_server[key] = value
+                        elif key == "args" and value:
+                            # Parse args if they're in a list format
+                            try:
+                                current_server["args"] = json.loads(value)
+                            except:
+                                current_server["args"] = [value] if value else []
+
+                # Add final server if exists
+                if current_server and "server_name" in current_server:
+                    servers.append(current_server)
+
+        except Exception as e:
+            self.logger.warning(f"Error parsing MCP query result: {e}")
+
+        # Ensure each server has required fields with defaults
+        for server in servers:
+            server.setdefault(
+                "description",
+                f"Specialized MCP server: {server.get('server_name', 'unknown')}",
+            )
+            server.setdefault("transport", "stdio")
+
+        return servers
 
     async def _analyze_user_intent_dynamic(
         self, message: str, context: Dict = None
@@ -1310,11 +1594,12 @@ class SlackMetaAgent:
 
             # Create a temporary agent to use OpenAI for routing
             if self.mcp_app:
-                # Use MCPApp to create routing agent
-                routing_agent = await self.mcp_app.create_agent(
+                # Create agent with MCPApp context for proper server registry access
+                routing_agent = Agent(
                     name="dynamic_router",
                     instruction="You are a routing agent that analyzes user requests and selects the best specialized agent.",
                     server_names=[],  # No MCP servers needed for routing
+                    context=self.mcp_app.context,  # Pass MCPApp context
                 )
             else:
                 # Fallback to direct Agent creation
