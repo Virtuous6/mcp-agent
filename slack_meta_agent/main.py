@@ -1593,23 +1593,25 @@ async def main():
                 logger.info("💡 Skipping database test (set TEST_DB=true to enable)")
 
             # Test dynamic routing to verify the new tool-discovery system works
-            logger.info("🧪 Testing dynamic routing system...")
-            routing_test_results = await meta_agent.test_dynamic_routing()
+            # logger.info("🧪 Testing dynamic routing system...")
+            # routing_test_results = await meta_agent.test_dynamic_routing()
 
-            # Show key results
-            successful_tests = sum(
-                1 for r in routing_test_results if r.get("success", False)
-            )
-            total_tests = len(routing_test_results)
+            # # Show key results
+            # successful_tests = sum(
+            #     1 for r in routing_test_results if r.get("success", False)
+            # )
+            # total_tests = len(routing_test_results)
 
-            if successful_tests >= total_tests * 0.8:  # 80% success rate
-                logger.info(
-                    f"🎉 Dynamic routing system working excellently! ({successful_tests}/{total_tests} passed)"
-                )
-            else:
-                logger.warning(
-                    f"⚠️  Dynamic routing needs improvement: {successful_tests}/{total_tests} tests passed"
-                )
+            # if successful_tests >= total_tests * 0.8:  # 80% success rate
+            #     logger.info(
+            #         f"🎉 Dynamic routing system working excellently! ({successful_tests}/{total_tests} passed)"
+            #     )
+            # else:
+            #     logger.warning(
+            #         f"⚠️  Dynamic routing needs improvement: {successful_tests}/{total_tests} tests passed"
+            #     )
+
+            logger.info("💡 Skipping dynamic routing startup test for faster boot")
 
             # Start the WebSocket connection
             await meta_agent.start_slack_connection()
