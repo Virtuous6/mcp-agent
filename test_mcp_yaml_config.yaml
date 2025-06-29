@@ -1,0 +1,27 @@
+$schema: ../schema/mcp-agent.config.schema.json
+
+execution_engine: asyncio
+logger:
+  transports: [console]
+  level: info
+  show_progress: true
+
+mcp:
+  servers:
+    # Test the working gmail-enhanced endpoint
+    n8n_gmail:
+      transport: "sse"
+      url: "https://advertisingreportcard.app.n8n.cloud/mcp/gmail-enhanced/sse"
+      description: "Working n8n workflow automation with Airtable integration"
+
+    # Test the arc_supabase endpoint
+    arc_supabase:
+      transport: "sse"
+      url: "https://advertisingreportcard.app.n8n.cloud/mcp/e566affb-4734-41c0-9295-a62be89771a4/sse"
+      description: "ARC Supabase MCP server"
+
+openai:
+  default_model: gpt-4o
+
+human_input:
+  enabled: true

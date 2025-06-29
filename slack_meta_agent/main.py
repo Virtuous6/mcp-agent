@@ -16,7 +16,7 @@ from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
 from mcp_agent.human_input.handler import console_input_callback
-from mcp_agent.human_input.types import HumanInputRequest
+from mcp_agent.human_input.types import HumanInputRequest, HumanInputResponse
 from rich import print
 
 # Import our custom Supabase logging
@@ -24,6 +24,9 @@ from supabase_logger import setup_supabase_logging
 
 # Import database configuration system
 from supabase_config_loader import get_settings_from_database, DatabaseConfig
+
+# Import universal MCP exploration strategy
+from universal_mcp_strategy import explore_any_mcp_server, print_exploration_results
 
 # Slack integration imports
 try:
@@ -254,6 +257,23 @@ class SlackMetaAgent:
                 ],
                 "agent": "automation_specialist",
                 "confidence": 0.85,
+                "usage_count": 0,
+            },
+            "server_exploration": {
+                "keywords": [
+                    "unknown server",
+                    "explore server",
+                    "test server",
+                    "server capabilities",
+                    "discover tools",
+                    "mcp server",
+                    "new endpoint",
+                    "what tools does",
+                    "how to use",
+                    "server analysis",
+                ],
+                "agent": "mcp_server_explorer",
+                "confidence": 0.9,
                 "usage_count": 0,
             },
         }
@@ -762,6 +782,37 @@ class SlackMetaAgent:
                     "data_querying",
                 ],
             ),
+            "mcp_server_explorer": AgentSpec(
+                name="mcp_server_explorer",
+                instruction="""You are an MCP server exploration specialist that can systematically 
+                analyze and test unknown MCP servers to discover their capabilities and extract valuable data.
+                
+                When users ask about unknown servers or need to explore new MCP endpoints, you can:
+                1. Analyze server schemas and tool requirements
+                2. Test parameter combinations intelligently  
+                3. Learn from error messages to adapt approach
+                4. Extract meaningful data from unknown servers
+                5. Provide actionable recommendations for server usage
+                
+                ALWAYS get user confirmation before exploring unknown servers, as this involves:
+                - Making multiple test calls to external systems
+                - Potentially triggering workflows or database operations
+                - Learning server capabilities through systematic testing
+                
+                Use the human input callback to:
+                1. Explain what exploration will involve
+                2. Get explicit permission before starting
+                3. Share findings and ask for next steps
+                4. Confirm before making any potentially destructive operations""",
+                server_names=[],  # Uses dynamic server configuration
+                capabilities=[
+                    "server_exploration",
+                    "schema_analysis",
+                    "parameter_discovery",
+                    "error_learning",
+                    "adaptive_testing",
+                ],
+            ),
         }
 
     async def initialize_slack(self, bot_token: str, app_token: str):
@@ -1003,11 +1054,18 @@ class SlackMetaAgent:
                 self._cleanup_request_conversation(request_id)
 
                 # Send formatted response to Slack (in a thread) with quality info
+                # Add safety check for None values
+                safe_intent_analysis = intent_analysis or {}
+                safe_quality_metrics = quality_metrics or {}
+                safe_result = (
+                    result or "I encountered an issue processing your request."
+                )
+
                 await self._send_enhanced_slack_response(
                     channel_id,
-                    result,
-                    intent_analysis,
-                    quality_metrics,
+                    safe_result,
+                    safe_intent_analysis,
+                    safe_quality_metrics,
                     thread_ts=message_ts,
                 )
 
@@ -1162,15 +1220,22 @@ class SlackMetaAgent:
         """Update learning patterns based on interaction success"""
         message_words = set(message.lower().split())
 
-        # Initialize agent entry if it doesn't exist
-        if agent_used not in self.pattern_learning:
-            self.pattern_learning[agent_used] = {"successful_keywords": set()}
+        # Create agent entry if it doesn't exist in dynamic patterns
+        if agent_used not in self.dynamic_patterns:
+            self.dynamic_patterns[agent_used] = {
+                "keywords": [],
+                "agent": agent_used,
+                "confidence": 0.7,
+                "usage_count": 0,
+            }
 
         # Track successful keywords
         if success:
             for word in message_words:
                 if len(word) > 3:  # Ignore short words
-                    self.pattern_learning[agent_used]["successful_keywords"].add(word)
+                    # Add word to keywords if not already present
+                    if word not in self.dynamic_patterns[agent_used]["keywords"]:
+                        self.dynamic_patterns[agent_used]["keywords"].append(word)
 
                     # Also check if we should add compound keywords (simple heuristic)
                     # Look for action + object patterns
@@ -1190,12 +1255,16 @@ class SlackMetaAgent:
                                 and potential_object != word
                             ):
                                 compound_keyword = f"{word}_{potential_object}"
-                                self.pattern_learning[agent_used][
-                                    "successful_keywords"
-                                ].add(compound_keyword)
-                                self.logger.debug(
-                                    f"📚 Added compound keyword: {compound_keyword} -> {agent_used}"
-                                )
+                                if (
+                                    compound_keyword
+                                    not in self.dynamic_patterns[agent_used]["keywords"]
+                                ):
+                                    self.dynamic_patterns[agent_used][
+                                        "keywords"
+                                    ].append(compound_keyword)
+                                    self.logger.debug(
+                                        f"📚 Added compound keyword: {compound_keyword} -> {agent_used}"
+                                    )
                                 break  # Only add one new keyword per successful interaction
 
         # Persist learning after updates
@@ -1372,7 +1441,67 @@ class SlackMetaAgent:
             discovered_servers = await self._dynamic_mcp_server_discovery(keywords)
 
             if not discovered_servers:
-                return f"⚠️ No specialized MCP servers found for '{', '.join(keywords)}'. Using standard agents."
+                self.logger.info(
+                    f"💡 No specialized servers found for '{', '.join(keywords)}', offering exploration option"
+                )
+
+                # Offer MCP server exploration for unknown servers
+                exploration_offered = await self._offer_server_exploration(
+                    keywords, message
+                )
+                if exploration_offered:
+                    return exploration_offered
+
+                self.logger.info(f"💡 Checking if server exists in MCPApp registry")
+
+                # Check if any of the keywords match existing servers in MCPApp
+                existing_server_found = False
+                if self.mcp_app and hasattr(self.mcp_app.context, "server_registry"):
+                    available_servers = list(
+                        self.mcp_app.context.server_registry.keys()
+                    )
+                    self.logger.info(
+                        f"🔍 Available servers in MCPApp: {available_servers}"
+                    )
+
+                    # Check if any keyword matches an existing server
+                    for keyword in keywords:
+                        if keyword in available_servers:
+                            self.logger.info(
+                                f"✅ Found matching server '{keyword}' in MCPApp registry!"
+                            )
+                            # Try to use the existing server directly
+                            try:
+                                existing_agent = await self.get_pooled_agent(
+                                    "data_researcher",
+                                    f"existing_server_{int(datetime.now().timestamp())}",
+                                )
+                                async with existing_agent:
+                                    llm = await existing_agent.attach_llm(
+                                        OpenAIAugmentedLLM
+                                    )
+                                    enhanced_prompt = f"""
+                                    Original request: {message}
+                                    
+                                    You have access to the '{keyword}' MCP server which matches the user's request.
+                                    Use the appropriate tools from this server to fulfill the request.
+                                    
+                                    Focus on providing specific, actionable results with relevant data.
+                                    """
+                                    result = await llm.generate_str(enhanced_prompt)
+                                    existing_server_found = True
+                                    return result
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"Failed to use existing server '{keyword}': {e}"
+                                )
+
+                if not existing_server_found:
+                    # Fall back to standard agents instead of returning an error message
+                    if agents:
+                        return await self._execute_sequential_fallback(message, agents)
+                    else:
+                        return f"⚠️ No specialized MCP servers found for '{', '.join(keywords)}' and no standard agents available."
 
             # Step 2: Create dynamic agent with discovered servers
             dynamic_agent = await self._create_dynamic_agent_with_servers(
@@ -1380,7 +1509,13 @@ class SlackMetaAgent:
             )
 
             if not dynamic_agent:
-                return f"❌ Failed to create dynamic agent with discovered servers."
+                self.logger.warning(
+                    "❌ Failed to create dynamic agent, falling back to standard agents"
+                )
+                if agents:
+                    return await self._execute_sequential_fallback(message, agents)
+                else:
+                    return f"❌ Failed to create dynamic agent with discovered servers and no standard agents available."
 
             # Step 3: Execute request with dynamic agent
             try:
@@ -1401,6 +1536,23 @@ class SlackMetaAgent:
                     return result
 
             finally:
+                # Clean up dynamic server registration if it exists
+                try:
+                    if (
+                        self.mcp_app
+                        and hasattr(self.mcp_app.context, "server_registry")
+                        and "dynamic_server"
+                        in self.mcp_app.context.server_registry.registry
+                    ):
+                        del self.mcp_app.context.server_registry.registry[
+                            "dynamic_server"
+                        ]
+                        self.logger.debug("🧹 Cleaned up dynamic server registration")
+                except Exception as cleanup_error:
+                    self.logger.warning(
+                        f"Dynamic server cleanup warning: {cleanup_error}"
+                    )
+
                 # Clean up dynamic agent
                 try:
                     await dynamic_agent.__aexit__(None, None, None)
@@ -1415,6 +1567,300 @@ class SlackMetaAgent:
             else:
                 return f"❌ Dynamic discovery failed: {str(e)}"
 
+    async def _offer_server_exploration(
+        self, keywords: List[str], message: str
+    ) -> Optional[str]:
+        """Offer MCP server exploration for unknown servers with human-in-the-loop confirmation"""
+        try:
+            # Check if this looks like a server exploration request
+            if not self._looks_like_server_exploration_request(keywords, message):
+                return None
+
+            self.logger.info(f"🔍 Offering server exploration for keywords: {keywords}")
+
+            # Use human input callback to get permission
+            from mcp_agent.human_input.types import HumanInputRequest
+
+            exploration_request = HumanInputRequest(
+                request_id=f"explore_{int(datetime.now().timestamp())}",
+                prompt=f"🔍 **Unknown MCP Server Exploration Request**\n\nI found keywords that might indicate an unknown MCP server: {', '.join(keywords)}\n\nWould you like me to systematically explore and test this server to discover its capabilities?\n\n**This exploration will:**\n- Test multiple parameter combinations\n- Make test calls to discover server capabilities\n- Learn from error messages to adapt approach\n- Generate actionable recommendations\n\n**Please respond with 'yes' to proceed or 'no' to skip**",
+                description="Request permission to explore unknown MCP server",
+            )
+
+            # Get user confirmation
+            response = await self.slack_human_input_callback(exploration_request)
+
+            if response.response.lower().strip() in ["yes", "y", "explore", "proceed"]:
+                self.logger.info("✅ User confirmed server exploration")
+                return await self._execute_server_exploration(keywords, message)
+            else:
+                self.logger.info("❌ User declined server exploration")
+                return "🔍 Server exploration declined. I'll try standard approaches instead."
+
+        except Exception as e:
+            self.logger.error(f"Server exploration offer error: {e}")
+            return None
+
+    def _looks_like_server_exploration_request(
+        self, keywords: List[str], message: str
+    ) -> bool:
+        """Determine if this looks like a request that could benefit from server exploration"""
+        message_lower = message.lower()
+
+        # Look for patterns that suggest unknown server exploration might be helpful
+        exploration_indicators = [
+            # Direct server/tool references
+            any(
+                keyword.endswith("_server") or keyword.endswith("_api")
+                for keyword in keywords
+            ),
+            any(keyword.startswith("mcp_") for keyword in keywords),
+            # Unknown service patterns with qualifiers (like "ARC supabase")
+            len([k for k in keywords if "_" in k]) > 0,
+            # Data access requests for potentially unknown sources
+            any(
+                phrase in message_lower
+                for phrase in [
+                    "records in",
+                    "data from",
+                    "connect to",
+                    "access to",
+                    "table in",
+                    "database",
+                    "api",
+                    "endpoint",
+                    "service",
+                ]
+            ),
+            # Organization-specific requests (uppercase acronyms + service)
+            any(len(k) <= 10 and k.isupper() for k in keywords if len(k) >= 2),
+        ]
+
+        # Only offer exploration if multiple indicators suggest this might be beneficial
+        indicator_count = sum(1 for indicator in exploration_indicators if indicator)
+
+        self.logger.debug(
+            f"Exploration indicators for '{message[:50]}...': {indicator_count}/5"
+        )
+        return indicator_count >= 2  # Need at least 2 indicators
+
+    async def _execute_server_exploration(
+        self, keywords: List[str], message: str
+    ) -> str:
+        """Execute systematic server exploration using the universal strategy"""
+        try:
+            self.logger.info(
+                f"🚀 Starting systematic server exploration for: {keywords}"
+            )
+
+            # Try to construct potential server configurations from keywords
+            potential_configs = self._generate_potential_server_configs(
+                keywords, message
+            )
+
+            if not potential_configs:
+                return "🔍 Could not determine potential server configurations from the request. Please provide more specific server details (URL, name, or connection information)."
+
+            exploration_results = []
+
+            for config in potential_configs:
+                self.logger.info(
+                    f"🔍 Exploring potential server: {config.get('server_name', 'Unknown')}"
+                )
+
+                try:
+                    # Use the universal exploration strategy
+                    results = await explore_any_mcp_server(config)
+
+                    if results and not results.get("error"):
+                        exploration_results.append(
+                            {"config": config, "results": results, "success": True}
+                        )
+
+                        # If we found working patterns, we can stop exploring
+                        if results.get("working_patterns"):
+                            self.logger.info(
+                                f"✅ Found working patterns, stopping exploration"
+                            )
+                            break
+                    else:
+                        exploration_results.append(
+                            {"config": config, "results": results, "success": False}
+                        )
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"Exploration failed for {config.get('server_name', 'Unknown')}: {e}"
+                    )
+                    exploration_results.append(
+                        {"config": config, "error": str(e), "success": False}
+                    )
+
+            # Format comprehensive exploration report
+            return self._format_exploration_report(
+                exploration_results, keywords, message
+            )
+
+        except Exception as e:
+            self.logger.error(f"Server exploration execution error: {e}")
+            return f"❌ Server exploration failed: {str(e)}"
+
+    def _generate_potential_server_configs(
+        self, keywords: List[str], message: str
+    ) -> List[Dict]:
+        """Generate potential server configurations based on keywords and message context"""
+        configs = []
+
+        # Look for compound keywords that might be server names (like "arc_supabase")
+        compound_keywords = [k for k in keywords if "_" in k]
+
+        for compound in compound_keywords:
+            # Try to map compound keywords to potential server configurations
+            if "supabase" in compound.lower():
+                configs.append(
+                    {
+                        "server_name": compound,
+                        "display_name": compound.replace("_", " ").title(),
+                        "description": f"Potential Supabase server: {compound}",
+                        "transport": "sse",  # Try SSE first as it's common for n8n workflows
+                        "url": self._guess_server_url(compound, "supabase"),
+                    }
+                )
+            elif "n8n" in compound.lower():
+                configs.append(
+                    {
+                        "server_name": compound,
+                        "display_name": compound.replace("_", " ").title(),
+                        "description": f"Potential n8n workflow server: {compound}",
+                        "transport": "sse",
+                        "url": self._guess_server_url(compound, "n8n"),
+                    }
+                )
+
+        # Also try organization + service combinations
+        org_keywords = [
+            k for k in keywords if len(k) <= 10 and k.isupper() and len(k) >= 2
+        ]
+        service_keywords = [
+            k
+            for k in keywords
+            if k.lower() in ["supabase", "airtable", "n8n", "api", "webhook"]
+        ]
+
+        for org in org_keywords:
+            for service in service_keywords:
+                server_name = f"{org.lower()}_{service.lower()}"
+                if server_name not in [
+                    c["server_name"] for c in configs
+                ]:  # Avoid duplicates
+                    configs.append(
+                        {
+                            "server_name": server_name,
+                            "display_name": f"{org} {service.title()}",
+                            "description": f"Potential {org} {service} server",
+                            "transport": "sse",
+                            "url": self._guess_server_url(server_name, service.lower()),
+                        }
+                    )
+
+        self.logger.info(f"🎯 Generated {len(configs)} potential server configurations")
+        return configs[:3]  # Limit to top 3 to avoid too many exploration attempts
+
+    def _guess_server_url(self, server_name: str, service_type: str) -> str:
+        """Attempt to guess server URL based on patterns (this is speculative)"""
+        # This is a fallback - in practice, users should provide actual URLs
+        # But we can make educated guesses based on common patterns
+
+        if service_type == "supabase" and "arc" in server_name.lower():
+            # Based on the pattern we discovered earlier
+            return "https://advertisingreportcard.app.n8n.cloud/mcp/[workflow-id]/sse"
+        elif service_type == "n8n":
+            return f"https://example.app.n8n.cloud/mcp/{server_name}/sse"
+        else:
+            return f"https://api.{server_name}.com/mcp/sse"
+
+    def _format_exploration_report(
+        self,
+        exploration_results: List[Dict],
+        keywords: List[str],
+        original_message: str,
+    ) -> str:
+        """Format a comprehensive exploration report for the user"""
+        report = []
+
+        report.append("🔍 **MCP Server Exploration Report**")
+        report.append("=" * 50)
+        report.append(
+            f"**Original Request:** {original_message[:100]}{'...' if len(original_message) > 100 else ''}"
+        )
+        report.append(f"**Keywords Analyzed:** {', '.join(keywords)}")
+        report.append("")
+
+        successful_explorations = [r for r in exploration_results if r.get("success")]
+        failed_explorations = [r for r in exploration_results if not r.get("success")]
+
+        if successful_explorations:
+            report.append("✅ **Successful Explorations:**")
+            report.append("")
+
+            for result in successful_explorations:
+                config = result["config"]
+                results = result["results"]
+
+                report.append(f"**🎯 {config['display_name']}**")
+                report.append(f"   Server: {config['server_name']}")
+                report.append(f"   Transport: {config['transport']}")
+
+                if results.get("tools_discovered"):
+                    tools = results["tools_discovered"]
+                    report.append(f"   Tools Found: {len(tools)}")
+                    for tool in tools[:3]:  # Show first 3 tools
+                        report.append(
+                            f"      - {tool['name']}: {tool['description'][:60]}..."
+                        )
+
+                if results.get("working_patterns"):
+                    patterns = results["working_patterns"]
+                    report.append(f"   Working Patterns: {len(patterns)}")
+                    for pattern in patterns[:2]:  # Show first 2 patterns
+                        report.append(f"      - {pattern['params']}")
+
+                if results.get("recommendations"):
+                    report.append("   Recommendations:")
+                    for rec in results["recommendations"][:3]:
+                        report.append(f"      - {rec}")
+
+                report.append("")
+
+        if failed_explorations:
+            report.append("❌ **Failed Explorations:**")
+            for result in failed_explorations:
+                config = result["config"]
+                error = result.get("error", "Unknown error")
+                report.append(f"   - {config['display_name']}: {error[:80]}...")
+            report.append("")
+
+        # Summary and next steps
+        if successful_explorations:
+            best_result = successful_explorations[0]
+            report.append("🚀 **Recommended Next Steps:**")
+            report.append(f"1. Use server: {best_result['config']['server_name']}")
+
+            if best_result["results"].get("working_patterns"):
+                best_pattern = best_result["results"]["working_patterns"][0]
+                report.append(f"2. Try parameters: {best_pattern['params']}")
+
+            report.append("3. Explore additional parameter variations")
+            report.append("4. Contact admin if authentication is needed")
+        else:
+            report.append("💡 **Alternative Approaches:**")
+            report.append("1. Verify server URLs and connection details")
+            report.append("2. Check if authentication credentials are needed")
+            report.append("3. Confirm server is running and accessible")
+            report.append("4. Try different transport methods (stdio, websocket)")
+
+        return "\n".join(report)
+
     def _parse_mcp_query_result(self, query_result: str) -> List[Dict]:
         """Parse the result from MCP server database query into server configurations"""
         import re
@@ -1423,20 +1869,81 @@ class SlackMetaAgent:
         servers = []
 
         try:
-            # Try to extract JSON from the result if it contains structured data
-            json_matches = re.findall(r"\{[^{}]*\}", query_result)
-
-            for json_str in json_matches:
+            # First, try to extract JSON arrays or objects from the result
+            # Look for JSON arrays first
+            json_array_matches = re.findall(r"\[[^\[\]]*\]", query_result, re.DOTALL)
+            for json_str in json_array_matches:
                 try:
-                    server_data = json.loads(json_str)
-                    if isinstance(server_data, dict) and "server_name" in server_data:
-                        servers.append(server_data)
+                    server_list = json.loads(json_str)
+                    if isinstance(server_list, list):
+                        for server_data in server_list:
+                            if (
+                                isinstance(server_data, dict)
+                                and "server_name" in server_data
+                            ):
+                                servers.append(server_data)
+                        if servers:  # If we found valid servers in an array, use them
+                            break
                 except json.JSONDecodeError:
                     continue
 
-            # If no JSON found, try to parse from structured text
+            # If no array found, try individual JSON objects
             if not servers:
-                # Look for patterns like "server_name: value"
+                json_matches = re.findall(r"\{[^{}]*\}", query_result)
+                for json_str in json_matches:
+                    try:
+                        server_data = json.loads(json_str)
+                        if (
+                            isinstance(server_data, dict)
+                            and "server_name" in server_data
+                        ):
+                            servers.append(server_data)
+                    except json.JSONDecodeError:
+                        continue
+
+            # If still no JSON found, try to parse from markdown-style text like:
+            # - **Server Name:** arc_supabase
+            # - **Display Name:** ARC supabase
+            if not servers:
+                self.logger.info("🔍 Trying to parse markdown-style server data...")
+
+                # Look for markdown-style server data blocks
+                markdown_pattern = r"-\s*\*\*Server Name:\*\*\s*(\w+)"
+                server_name_matches = re.findall(
+                    markdown_pattern, query_result, re.IGNORECASE
+                )
+
+                for server_name in server_name_matches:
+                    server_block = {}
+                    server_block["server_name"] = server_name
+
+                    # Extract other fields using patterns
+                    patterns = {
+                        "display_name": r"-\s*\*\*Display Name:\*\*\s*([^\n]+)",
+                        "description": r"-\s*\*\*Description:\*\*\s*([^\n]+)",
+                        "transport": r"-\s*\*\*Transport:\*\*\s*([^\n]+)",
+                        "url": r"-\s*\*\*URL:\*\*\s*([^\n]+)",
+                        "command": r"-\s*\*\*Command:\*\*\s*([^\n]+)",
+                    }
+
+                    for field, pattern in patterns.items():
+                        match = re.search(pattern, query_result, re.IGNORECASE)
+                        if match:
+                            value = match.group(1).strip()
+                            if value and value.lower() not in ["null", "none", ""]:
+                                server_block[field] = value
+
+                    # Set default args
+                    server_block["args"] = []
+
+                    if server_block.get("server_name"):
+                        servers.append(server_block)
+                        self.logger.info(
+                            f"✅ Parsed server from markdown: {server_block['server_name']}"
+                        )
+
+            # If still no structured data, try old key:value parsing
+            if not servers:
                 lines = query_result.split("\n")
                 current_server = {}
 
@@ -1451,18 +1958,27 @@ class SlackMetaAgent:
                     # Parse key: value pairs
                     if ":" in line:
                         key, value = line.split(":", 1)
-                        key = key.strip().lower()
+                        key = (
+                            key.strip()
+                            .lower()
+                            .replace("*", "")
+                            .replace("-", "")
+                            .strip()
+                        )
                         value = value.strip().strip("\"'")
 
                         if key in [
                             "server_name",
+                            "server name",
                             "display_name",
+                            "display name",
                             "description",
                             "transport",
                             "url",
                             "command",
                         ]:
-                            current_server[key] = value
+                            normalized_key = key.replace(" ", "_")
+                            current_server[normalized_key] = value
                         elif key == "args" and value:
                             # Parse args if they're in a list format
                             try:
@@ -1476,6 +1992,9 @@ class SlackMetaAgent:
 
         except Exception as e:
             self.logger.warning(f"Error parsing MCP query result: {e}")
+            import traceback
+
+            self.logger.warning(f"Full parsing error: {traceback.format_exc()}")
 
         # Ensure each server has required fields with defaults
         for server in servers:
@@ -1484,6 +2003,15 @@ class SlackMetaAgent:
                 f"Specialized MCP server: {server.get('server_name', 'unknown')}",
             )
             server.setdefault("transport", "stdio")
+            server.setdefault("args", [])
+
+        self.logger.info(
+            f"🎯 Successfully parsed {len(servers)} servers from query result"
+        )
+        for server in servers:
+            self.logger.info(
+                f"   - {server['server_name']}: {server.get('transport', 'stdio')} @ {server.get('url', 'no-url')}"
+            )
 
         return servers
 
@@ -2426,14 +2954,19 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
             },
         }
 
-    async def slack_human_input_callback(self, request: HumanInputRequest) -> str:
+    async def slack_human_input_callback(
+        self, request: HumanInputRequest
+    ) -> HumanInputResponse:
         """Handle human input requests by sending them to Slack and waiting for response"""
         try:
             if not self.slack_client or not self.current_thread_ts:
                 self.logger.warning(
                     "No Slack client or thread context for human input, falling back to console"
                 )
-                return console_input_callback(request)
+                # Import and call the console fallback
+                from mcp_agent.human_input.handler import console_input_callback
+
+                return await console_input_callback(request)
 
             # Extract context from current conversation
             channel_id = getattr(self, "current_channel_id", None)
@@ -2443,7 +2976,9 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 self.logger.warning(
                     "No channel/user context for human input, falling back to console"
                 )
-                return console_input_callback(request)
+                from mcp_agent.human_input.handler import console_input_callback
+
+                return await console_input_callback(request)
 
             self.logger.info(
                 f"🤖 Sending human input request to Slack for user {user_id}"
@@ -2454,7 +2989,7 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
 {request.prompt}
 
-💡 **Instructions:** {request.instructions or "Please provide the requested information."}
+💡 **Context:** {request.description or "Please provide the requested information."}
 
 *Reply in this thread to continue...*
 """
@@ -2487,7 +3022,10 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 self.logger.info(
                     f"✅ Received human input response: {user_response[:50]}..."
                 )
-                return user_response
+                return HumanInputResponse(
+                    request_id=request.request_id or "slack_input",
+                    response=user_response,
+                )
 
             except asyncio.TimeoutError:
                 self.logger.warning("⏰ Human input request timed out")
@@ -2503,14 +3041,19 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                     thread_ts=self.current_thread_ts,
                 )
 
-                return "Request timed out. Please try again."
+                return HumanInputResponse(
+                    request_id=request.request_id or "slack_timeout",
+                    response="Request timed out. Please try again.",
+                )
 
         except Exception as e:
             self.logger.error(f"Error in Slack human input callback: {e}")
             import traceback
 
             self.logger.error(f"Full traceback: {traceback.format_exc()}")
-            return console_input_callback(request)
+            from mcp_agent.human_input.handler import console_input_callback
+
+            return await console_input_callback(request)
 
     def _clean_user_input(self, message_text: str) -> str:
         """Clean user input by removing mentions, formatting, etc."""
@@ -2571,10 +3114,14 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
             return
 
         try:
+            # Ensure we have valid dictionaries
+            safe_analysis = analysis or {}
+            safe_quality_metrics = quality_metrics or {}
+
             # Create status indicators based on quality metrics
-            execution_time = quality_metrics.get("execution_time", 0)
-            confidence = analysis.get("confidence", "unknown")
-            intent_name = analysis.get("intent_name", "unknown")
+            execution_time = safe_quality_metrics.get("execution_time", 0)
+            confidence = safe_analysis.get("confidence", "unknown")
+            intent_name = safe_analysis.get("intent_name", "unknown")
 
             # Timing indicators
             if execution_time < 5:
@@ -2599,21 +3146,21 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 📊 **Performance Metrics:**
 • Processing time: {execution_time:.1f}s
 • Intent confidence: {confidence_emoji} {confidence}
-• Agents used: {quality_metrics.get("agent_count", 1)}
+• Agents used: {safe_quality_metrics.get("agent_count", 1)}
 • Routing: {"⚡ Fast Pattern Match" if intent_name.startswith("fast_") else "🤖 LLM Routing"}
 
 *Optimized with pre-warmed agents & caching*
 """
             else:
                 # Standard response formatting with dynamic info
-                routing_info = self._get_routing_info(analysis)
-                pattern_info = self._get_pattern_info(analysis)
+                routing_info = self._get_routing_info(safe_analysis)
+                pattern_info = self._get_pattern_info(safe_analysis)
 
                 formatted_response = f"""{confidence_emoji} **Agent Response** ({timing_emoji} {execution_time:.1f}s)
 
 {result}
 
-*{routing_info} | Strategy: {analysis.get("execution_strategy", "unknown")} | {pattern_info}*
+*{routing_info} | Strategy: {safe_analysis.get("execution_strategy", "unknown")} | {pattern_info}*
 """
 
             self.slack_client.chat_postMessage(
@@ -2625,8 +3172,10 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
         except Exception as e:
             self.logger.error(f"Error sending enhanced Slack response: {e}")
-            # Fallback to basic response
-            await self._send_slack_response(channel_id, result, analysis, thread_ts)
+            # Fallback to basic response with safe values
+            await self._send_slack_response(
+                channel_id, result, safe_analysis, thread_ts
+            )
 
     def _get_routing_info(self, analysis: Dict) -> str:
         """Get routing information for display"""
@@ -2796,8 +3345,31 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
 
                 # Build keyword search conditions for qualified service names
                 keyword_conditions = []
-                for keyword in query_keywords:
-                    # Search in server_name, display_name, and description (properly qualified)
+
+                # Look for compound keywords first (like "arc_supabase") for exact matches
+                compound_keywords = [k for k in query_keywords if "_" in k]
+                simple_keywords = [k for k in query_keywords if "_" not in k]
+
+                for keyword in compound_keywords:
+                    # For compound keywords like "arc_supabase", search more precisely
+                    # Look for server names that contain both parts
+                    parts = keyword.split("_")
+                    if len(parts) == 2:
+                        org_part, service_part = parts
+                        # Search for patterns like "arc_supabase" or "arc supabase" in server name
+                        keyword_conditions.append(
+                            f"LOWER(s.server_name) LIKE LOWER('%{org_part}%{service_part}%')"
+                        )
+                        keyword_conditions.append(
+                            f"LOWER(s.server_name) LIKE LOWER('%{org_part}_{service_part}%')"
+                        )
+                        keyword_conditions.append(
+                            f"LOWER(s.display_name) LIKE LOWER('%{org_part}%{service_part}%')"
+                        )
+
+                # Add simple keyword searches
+                for keyword in simple_keywords:
+                    # Search in server_name, display_name, and description
                     keyword_conditions.append(
                         f"LOWER(s.server_name) LIKE LOWER('%{keyword}%')"
                     )
@@ -2808,10 +3380,9 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                         f"LOWER(s.description) LIKE LOWER('%{keyword}%')"
                     )
 
-                    # TODO: Add environment variables search once we know the correct column names
-                    # For now, search only in main server fields
-
-                where_clause = " OR ".join(keyword_conditions)
+                where_clause = (
+                    " OR ".join(keyword_conditions) if keyword_conditions else "1=1"
+                )
 
                 self.logger.info(
                     f"🔍 Searching for qualified services with keywords: {query_keywords}"
@@ -2834,14 +3405,50 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 ORDER BY s.priority ASC;
                 """
 
+                # Debug log the query being executed
+                self.logger.info(f"🔍 Executing SQL query: {sql_query}")
+
+                # First, let's see what servers are actually in the database
+                debug_query = """
+                SELECT 
+                    s.server_name,
+                    s.display_name,
+                    s.description
+                FROM mcp_servers s
+                JOIN mcp_configurations c ON s.configuration_id = c.id
+                WHERE c.is_active = true 
+                AND s.is_enabled = true
+                ORDER BY s.server_name;
+                """
+
+                debug_prompt = f"""
+                First, let me see what MCP servers are available in the database.
+                
+                Use the execute_sql tool with:
+                - project_id: "{self.supabase_project_id}"
+                - query: "{debug_query}"
+                
+                Show me all available servers, then execute the specific search query.
+                """
+
+                debug_result = await llm.generate_str(debug_prompt)
+                self.logger.info(
+                    f"📋 Available servers in database: {debug_result[:500]}..."
+                )
+
                 prompt = f"""
-                Query the database to find MCP servers that match these keywords: {query_keywords}
+                Now query the database to find MCP servers that match these keywords: {query_keywords}
                 
                 Use the execute_sql tool with:
                 - project_id: "{self.supabase_project_id}"
                 - query: "{sql_query}"
                 
-                Execute the SQL query and return the server details.
+                Execute the SQL query and return the server details in this EXACT JSON format:
+                
+                For each server found, return JSON like:
+                {{"server_name": "exact_name", "display_name": "display", "description": "desc", "transport": "sse/stdio", "url": "https://...", "command": "cmd_if_any", "args": ["arg1", "arg2"]}}
+                
+                If multiple servers, return a JSON array. If no servers found, return an empty array [].
                 """
 
                 result = await llm.generate_str(prompt)
@@ -2888,53 +3495,168 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
         self, server_configs: List[Dict], agent_name: str = "dynamic_agent"
     ) -> Optional[Agent]:
         """
-        Create a temporary agent with dynamically discovered MCP servers
+        Create a temporary agent with dynamically discovered MCP servers using a configurable "dynamic_server" slot
         """
         try:
-            server_names = [config["server_name"] for config in server_configs]
+            if not server_configs:
+                self.logger.warning("No server configurations provided")
+                return None
 
-            self.logger.info(f"🚀 Creating dynamic agent with servers: {server_names}")
+            # Use the first discovered server (we can extend this later for multiple servers)
+            primary_config = server_configs[0]
+            server_name = primary_config["server_name"]
 
-            # Create agent with discovered servers
-            if self.mcp_app:
-                # Create agent with MCPApp context for proper server registry access
-                dynamic_agent = Agent(
-                    name=f"{agent_name}_{int(datetime.now().timestamp())}",
-                    instruction=f"""You are a dynamic agent with access to specialized MCP servers: {", ".join(server_names)}.
-                    
-                    Use these servers to fulfill user requests. Focus on:
-                    - Using the most appropriate server for each task
-                    - Providing specific, actionable results
-                    - Including relevant URLs, IDs, or identifiers in responses
-                    
-                    Available servers: {[f"{s['server_name']}: {s['description']}" for s in server_configs]}""",
-                    server_names=server_names,
-                    context=self.mcp_app.context,  # Pass MCPApp context
-                )
-                await dynamic_agent.__aenter__()
-            else:
-                # Fallback to direct Agent creation
-                dynamic_agent = Agent(
-                    name=f"{agent_name}_{int(datetime.now().timestamp())}",
-                    instruction=f"""You are a dynamic agent with access to specialized MCP servers: {", ".join(server_names)}.
-                    
-                    Use these servers to fulfill user requests. Focus on:
-                    - Using the most appropriate server for each task
-                    - Providing specific, actionable results
-                    - Including relevant URLs, IDs, or identifiers in responses
-                    
-                    Available servers: {[f"{s['server_name']}: {s['description']}" for s in server_configs]}""",
-                    server_names=server_names,
-                )
-                await dynamic_agent.__aenter__()
-
+            self.logger.info(f"🚀 Creating dynamic agent with server: {server_name}")
             self.logger.info(
-                f"✅ Dynamic agent created with {len(server_names)} servers"
+                f"   📡 {server_name}: {primary_config.get('transport', 'stdio')} @ {primary_config.get('url', 'N/A')}"
             )
-            return dynamic_agent
+
+            if not self.mcp_app:
+                self.logger.error(
+                    "❌ MCPApp context required for dynamic server creation"
+                )
+                return None
+
+            # 🎯 KEY INSIGHT: Use a pre-configured "dynamic_server" slot that we can reconfigure at runtime
+            # First, let's configure the dynamic server slot with the discovered server's settings
+            from mcp_agent.config import MCPServerSettings
+
+            dynamic_server_config = MCPServerSettings(
+                name=primary_config.get("display_name", server_name),
+                description=primary_config.get(
+                    "description", f"Dynamically discovered server: {server_name}"
+                ),
+                transport=primary_config.get("transport", "sse"),
+                url=primary_config.get("url"),
+                command=primary_config.get("command"),
+                args=primary_config.get("args", []),
+                headers=primary_config.get("headers"),
+                terminate_on_close=primary_config.get("terminate_on_close", True),
+            )
+
+            # Temporarily add/update the dynamic server in the registry
+            dynamic_server_name = "dynamic_server"
+            if hasattr(self.mcp_app.context, "server_registry"):
+                self.mcp_app.context.server_registry.registry[dynamic_server_name] = (
+                    dynamic_server_config
+                )
+                self.logger.info(
+                    f"✅ Configured dynamic server slot with {server_name} settings"
+                )
+
+                # Create agent with the dynamic server slot
+                dynamic_agent = Agent(
+                    name=f"{agent_name}_{int(datetime.now().timestamp())}",
+                    instruction=f"""You are a dynamic agent with access to the '{server_name}' MCP server.
+                    
+                    When a user asks about data or records, be PROACTIVE:
+                    1. Start by listing available tables using list_tables or similar tools
+                    2. Show sample data from relevant tables 
+                    3. Provide specific, actionable results with actual data
+                    4. Only ask for clarification if absolutely necessary after exploring the database
+                    
+                    Server: {server_name} ({primary_config.get("transport", "stdio")} transport)
+                    Description: {primary_config.get("description", "Dynamically discovered server")}
+                    
+                    For ARC Supabase queries:
+                    - Use list_tables to see what tables are available
+                    - Use execute_sql to query specific data 
+                    - Use get_all_rows to retrieve records
+                    - Show actual table names and data, not just ask for clarification
+                    """,
+                    server_names=[dynamic_server_name],  # Use the dynamic server slot
+                    context=self.mcp_app.context,
+                    human_input_callback=self.slack_human_input_callback,
+                )
+
+                # Try to initialize the agent
+                try:
+                    await dynamic_agent.__aenter__()
+                    self.logger.info(
+                        f"✅ Dynamic agent created successfully using server slot"
+                    )
+                    return dynamic_agent
+                except Exception as init_error:
+                    self.logger.error(
+                        f"❌ Failed to initialize dynamic agent: {init_error}"
+                    )
+
+                    # Clean up the dynamic server registration
+                    if (
+                        dynamic_server_name
+                        in self.mcp_app.context.server_registry.registry
+                    ):
+                        del self.mcp_app.context.server_registry.registry[
+                            dynamic_server_name
+                        ]
+
+                    # Try fallback with existing servers
+                    return await self._try_fallback_servers(primary_config, agent_name)
+            else:
+                self.logger.error("🔍 No server_registry found in MCPApp context")
+                return None
 
         except Exception as e:
             self.logger.error(f"Failed to create dynamic agent: {e}")
+            import traceback
+
+            self.logger.error(f"Full error: {traceback.format_exc()}")
+            return None
+
+    async def _try_fallback_servers(
+        self, primary_config: Dict, agent_name: str
+    ) -> Optional[Agent]:
+        """Try fallback servers if dynamic server creation fails"""
+        try:
+            if hasattr(self.mcp_app.context, "server_registry"):
+                available_servers = list(
+                    self.mcp_app.context.server_registry.registry.keys()
+                )
+                self.logger.info(f"🔍 Available servers in MCPApp: {available_servers}")
+
+                # Try using an existing registered server that might work
+                potential_servers = ["supabase", "arc_supabase"]
+                for potential_server in potential_servers:
+                    if potential_server in available_servers:
+                        self.logger.info(
+                            f"🔄 Fallback: Trying with existing server '{potential_server}'"
+                        )
+
+                        fallback_agent = Agent(
+                            name=f"fallback_{agent_name}_{int(datetime.now().timestamp())}",
+                            instruction=f"""You are an agent with access to the '{potential_server}' MCP server.
+                            
+                            The user asked about ARC Supabase records. Be PROACTIVE:
+                            1. FIRST: Use list_tables to show what tables are available
+                            2. THEN: Use execute_sql or get_all_rows to show sample data from relevant tables
+                            3. FOCUS: Show actual table names, row counts, and sample records
+                            4. AVOID: Asking for clarification - explore the database first!
+                            
+                            For time-based queries, look for tables with date/timestamp columns.
+                            Show the user what data exists rather than asking what they want.
+                            
+                            Original request context: {primary_config.get("description", "ARC Supabase data query")}
+                            """,
+                            server_names=[potential_server],
+                            context=self.mcp_app.context,
+                            human_input_callback=self.slack_human_input_callback,
+                        )
+
+                        try:
+                            await fallback_agent.__aenter__()
+                            self.logger.info(
+                                f"✅ Fallback agent created with '{potential_server}' server"
+                            )
+                            return fallback_agent
+                        except Exception as fallback_error:
+                            self.logger.warning(
+                                f"⚠️ Fallback with '{potential_server}' also failed: {fallback_error}"
+                            )
+                            continue
+
+            return None
+        except Exception as e:
+            self.logger.warning(f"Fallback server creation failed: {e}")
             return None
 
 
@@ -3034,7 +3756,7 @@ async def main():
             app_instance = MCPApp(
                 name="slack_meta_agent_merged",
                 settings=base_settings,  # Now contains merged servers
-                human_input_callback=console_input_callback,
+                human_input_callback=console_input_callback,  # Will be overridden by SlackMetaAgent
             )
 
         except Exception as e:
@@ -3044,7 +3766,7 @@ async def main():
             app_instance = MCPApp(
                 name="slack_meta_agent",
                 settings=base_settings,
-                human_input_callback=console_input_callback,
+                human_input_callback=console_input_callback,  # Will be overridden by SlackMetaAgent
             )
     else:
         print(
@@ -3054,7 +3776,7 @@ async def main():
         app_instance = MCPApp(
             name="slack_meta_agent",
             settings=base_settings,
-            human_input_callback=console_input_callback,
+            human_input_callback=console_input_callback,  # Will be overridden by SlackMetaAgent
         )
 
     # Load Slack tokens from secrets (still need this regardless of MCP config)
@@ -3099,8 +3821,19 @@ async def main():
         meta_agent.session_id = session_id
         meta_agent.supabase_log_handler = supabase_handler
 
-        # Note: Human input will be handled through Slack message threading
-        # The console_input_callback is used as fallback for non-Slack scenarios
+        # 🎯 Override MCPApp's human input callback to use Slack
+        if hasattr(agent_app, "context") and hasattr(
+            agent_app.context, "human_input_callback"
+        ):
+            original_callback = agent_app.context.human_input_callback
+            agent_app.context.human_input_callback = (
+                meta_agent.slack_human_input_callback
+            )
+            logger.info("✅ Overrode MCPApp human input callback to use Slack")
+        else:
+            logger.warning("⚠️ Could not override MCPApp human input callback")
+
+        # Note: Human input will now be handled through Slack message threading
 
         try:
             # Load dynamic configuration
