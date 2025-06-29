@@ -2678,17 +2678,27 @@ async def main():
     config_name = os.getenv(
         "MCP_CONFIG_NAME", "slack_meta_agent"
     )  # Default to production-ready config
-    use_database_config = os.getenv("USE_DATABASE_CONFIG", "true").lower() in [
+    use_database_config = os.getenv("USE_DATABASE_CONFIG", "false").lower() in [
         "true",
         "1",
         "yes",
     ]
 
-    print(f"📊 Configuration Mode: {'Database' if use_database_config else 'YAML'}")
+    print(
+        f"📊 Configuration Mode: {'YAML + Database (Merged)' if use_database_config else 'YAML Only'}"
+    )
+
+    # Always load base YAML configuration first
+    print("📄 Loading base YAML configuration...")
+    from mcp_agent.config import get_settings
+
+    base_settings = get_settings("mcp_agent.config.yaml")
 
     if use_database_config:
         try:
-            print(f"🔍 Loading configuration '{config_name}' from database...")
+            print(
+                f"🔍 Loading additional configuration '{config_name}' from database..."
+            )
 
             # Set environment variables for database connection
             os.environ.setdefault("SUPABASE_PROJECT_ID", supabase_project_id)
@@ -2697,41 +2707,69 @@ async def main():
                 "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxZ2dkdmZleWJmenFtZ3htaWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTExNTA2MjEsImV4cCI6MjA2NjcyNjYyMX0.aDsWKJjhYqh-Ptq63LnP5YGnMsTiXxAbI9gMi09UEs0",
             )
 
-            # Load configuration from database
-            settings = await get_settings_from_database(
+            # Load additional configuration from database
+            db_settings = await get_settings_from_database(
                 config_name=config_name,
-                config_path="mcp_agent.config.yaml",  # fallback
+                config_path=None,  # Don't use fallback, we already have base YAML
             )
 
-            if settings and settings.mcp and settings.mcp.servers:
-                print(f"✅ Database configuration loaded!")
-                print(f"   - Servers: {list(settings.mcp.servers.keys())}")
-                if "arc_supabase" in settings.mcp.servers:
+            # Merge configurations: YAML base + Database additional
+            if db_settings and db_settings.mcp and db_settings.mcp.servers:
+                # Start with base YAML servers
+                merged_servers = (
+                    dict(base_settings.mcp.servers)
+                    if base_settings.mcp and base_settings.mcp.servers
+                    else {}
+                )
+
+                # Add database servers (will override YAML if same name)
+                merged_servers.update(db_settings.mcp.servers)
+
+                # Create merged settings
+                from mcp_agent.config import MCPSettings
+
+                base_settings.mcp = MCPSettings(servers=merged_servers)
+
+                print(f"✅ Merged configuration loaded!")
+                yaml_servers = (
+                    list((base_settings.mcp.servers or {}).keys())
+                    if base_settings.mcp and base_settings.mcp.servers
+                    else []
+                )
+                print(f"   - YAML servers: {yaml_servers}")
+                print(f"   - Database servers: {list(db_settings.mcp.servers.keys())}")
+                print(f"   - Total servers: {list(merged_servers.keys())}")
+
+                if "arc_supabase" in merged_servers:
                     print(f"   - 🔗 ARC Supabase: Connected")
             else:
-                print(f"⚠️  Database config incomplete, using YAML fallback")
+                print(f"⚠️  No additional database servers found, using YAML only")
 
-            # Create MCPApp with database configuration (callback will be set up later)
+            # Create MCPApp with merged configuration
             app_instance = MCPApp(
-                name="slack_meta_agent_db",
-                settings=settings,
+                name="slack_meta_agent_merged",
+                settings=base_settings,  # Now contains merged servers
                 human_input_callback=console_input_callback,
             )
 
         except Exception as e:
-            print(f"❌ Database configuration failed: {e}")
-            print(f"🔄 Falling back to YAML configuration...")
-            # Fallback to YAML
+            print(f"❌ Database configuration merge failed: {e}")
+            print(f"🔄 Using YAML configuration only...")
+            # Use base YAML settings
             app_instance = MCPApp(
-                name="slack_meta_agent", human_input_callback=console_input_callback
+                name="slack_meta_agent",
+                settings=base_settings,
+                human_input_callback=console_input_callback,
             )
     else:
         print(
-            f"📄 Using YAML configuration (set USE_DATABASE_CONFIG=true to enable database)"
+            f"📄 Using YAML configuration only (set USE_DATABASE_CONFIG=true to enable merge)"
         )
-        # Use traditional YAML configuration - will update callback later
+        # Use base YAML configuration
         app_instance = MCPApp(
-            name="slack_meta_agent", human_input_callback=console_input_callback
+            name="slack_meta_agent",
+            settings=base_settings,
+            human_input_callback=console_input_callback,
         )
 
     # Load Slack tokens from secrets (still need this regardless of MCP config)
