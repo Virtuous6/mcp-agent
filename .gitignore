@@ -177,3 +177,7 @@ prompt.md
 # example logs
 examples/**/*.jsonl
 **/.DS_Store
+
+mcp_agent.secrets.yaml
+
+/slack_meta_agent/logs

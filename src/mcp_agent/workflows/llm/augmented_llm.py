@@ -331,6 +331,19 @@ class AugmentedLLM(ContextDependent, AugmentedLLMProtocol[MessageParamT, Message
                     span.set_attribute("model", model)
                     return model
 
+            # Get the configured default model from context
+            default_model = None
+            if self.context and hasattr(self.context, "config"):
+                openai_config = getattr(self.context.config, "openai", {})
+                if isinstance(openai_config, dict):
+                    default_model = openai_config.get("default_model")
+                else:
+                    default_model = getattr(openai_config, "default_model", None)
+
+            # Fallback to default_request_params model
+            if not default_model and self.default_request_params:
+                default_model = self.default_request_params.model
+
             if not self.model_selector:
                 self.model_selector = ModelSelector(context=self.context)
 
@@ -339,16 +352,30 @@ class AugmentedLLM(ContextDependent, AugmentedLLMProtocol[MessageParamT, Message
                     model_preferences=model_preferences, provider=self.provider
                 )
 
+                # Check if the selected model is an o3/o4 model that requires verification
+                # These models are known to require organization verification
+                restricted_models = ["o3-2025-04-16", "o3-pro-2025-06-10", "o4-mini"]
+                if model_info.name in restricted_models or model_info.name.startswith(
+                    ("o3-", "o4-")
+                ):
+                    span.set_attribute(
+                        "model_selection.restricted_model_detected", model_info.name
+                    )
+                    if default_model:
+                        span.set_attribute(
+                            "model_selection.fallback_to_default", default_model
+                        )
+                        span.set_attribute("model", default_model)
+                        return default_model
+                    else:
+                        span.set_attribute("model_selection.no_default_available", True)
+
                 span.set_attribute("model", model_info.name)
                 return model_info.name
             except ValueError as e:
                 span.record_exception(e)
                 span.set_status(trace.Status(trace.StatusCode.ERROR))
-                model = (
-                    self.default_request_params.model
-                    if self.default_request_params
-                    else None
-                )
+                model = default_model
                 if model:
                     span.set_attribute("model", model)
                 return model
