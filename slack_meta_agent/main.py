@@ -2183,14 +2183,18 @@ async def main():
     # 🗂️ Initialize Supabase logging FIRST (before Meta-Agent system)
     supabase_project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
     session_id, supabase_handler = setup_supabase_logging(
-        project_id=supabase_project_id, level="INFO"
+        project_id=supabase_project_id,
+        level="INFO",
+        use_session_aggregation=True,  # Use session aggregation to combine all logs into one record
     )
 
-    print(f"🗂️ Logging Session: {session_id}")
+    print(f"🗂️ Logging Session (Aggregated): {session_id}")
 
     # Initialize the Meta-Agent system
     async with app.run() as agent_app:
-        logger = agent_app.logger
+        logger = logging.getLogger(
+            "SlackMetaAgent"
+        )  # Use consistent logger for session aggregation
 
         # Create and initialize the meta-agent
         meta_agent = SlackMetaAgent(supabase_project_id=supabase_project_id)
@@ -2308,6 +2312,19 @@ async def main():
             except Exception as e:
                 logger.warning(f"Cleanup warning: {e}")
 
+            # Finalize session logging - write all aggregated logs to Supabase
+            try:
+                if hasattr(supabase_handler, "finalize_session"):
+                    success = supabase_handler.finalize_session()
+                    if success:
+                        logger.info(
+                            f"✅ Session logs saved to Supabase (session: {session_id})"
+                        )
+                    else:
+                        logger.warning("⚠️ Failed to save session logs to Supabase")
+            except Exception as e:
+                logger.warning(f"Session finalization error: {e}")
+
         except Exception as e:
             logger.error(f"💥 Meta-Agent error: {e}")
 
@@ -2316,6 +2333,16 @@ async def main():
                 await meta_agent.cleanup()
             except:  # noqa: E722
                 pass
+
+            # Still try to finalize session logs even on error
+            try:
+                if hasattr(supabase_handler, "finalize_session"):
+                    supabase_handler.finalize_session()
+                    logger.info(
+                        f"✅ Session logs saved despite error (session: {session_id})"
+                    )
+            except Exception as cleanup_error:
+                logger.warning(f"Session cleanup error: {cleanup_error}")
 
             raise
 

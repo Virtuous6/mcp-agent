@@ -3,7 +3,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import threading
 import queue
 import os
@@ -20,36 +20,30 @@ except ImportError:
     SUPABASE_AVAILABLE = False
 
 
-class SupabaseLogHandler(logging.Handler):
-    """Custom logging handler that sends logs to Supabase database using direct client"""
+class SessionLogAggregator:
+    """Aggregates all logs for a session into a single database record"""
 
-    def __init__(self, project_id: str, session_id: Optional[uuid.UUID] = None):
-        super().__init__()
+    def __init__(self, project_id: str, session_id: uuid.UUID):
         self.project_id = project_id
-        self.session_id = session_id or uuid.uuid4()
-        self.log_queue = queue.Queue()
+        self.session_id = session_id
+        self.session_logs: List[Dict[str, Any]] = []
+        self.session_start_time = datetime.now()
+        self.session_metadata = {
+            "user_interactions": [],
+            "agents_used": set(),
+            "tools_called": set(),
+            "servers_connected": set(),
+            "error_count": 0,
+            "warning_count": 0,
+        }
         self.supabase_client: Optional[Client] = None
         self.client_initialized = False
-        self.batch_size = 50  # Larger batches to reduce noise
-        self.batch_timeout = 10.0  # Longer timeout for better batching
-        self.pending_logs = []
-        self.last_batch_time = datetime.now()
-
-        # Load Supabase credentials
-        self.supabase_url = None
-        self.supabase_service_key = None
         self._load_supabase_credentials()
-
-        # Start background thread for log processing
-        self.background_thread = threading.Thread(
-            target=self._background_processor, daemon=True
-        )
-        self.background_thread.start()
+        self._lock = threading.Lock()
 
     def _load_supabase_credentials(self):
         """Load Supabase credentials from secrets file"""
         try:
-            # Look for secrets file in current directory and parent directories
             current_dir = Path.cwd()
             secrets_file = None
 
@@ -90,14 +84,185 @@ class SupabaseLogHandler(logging.Handler):
                         self.supabase_url, self.supabase_service_key
                     )
                     self.client_initialized = True
-                    # Silent initialization
                 else:
                     print("⚠️ Missing Supabase URL or service key")
             except Exception as e:
                 print(f"⚠️ Failed to initialize Supabase client: {e}")
 
+    def add_log(self, log_data: Dict[str, Any]):
+        """Add a log entry to the session buffer"""
+        with self._lock:
+            # Add timestamp if not present
+            if "timestamp" not in log_data:
+                log_data["timestamp"] = datetime.now().isoformat()
+
+            self.session_logs.append(log_data)
+
+            # Update session metadata
+            if log_data.get("level") == "ERROR":
+                self.session_metadata["error_count"] += 1
+            elif log_data.get("level") == "WARNING":
+                self.session_metadata["warning_count"] += 1
+
+            if log_data.get("agent_name"):
+                self.session_metadata["agents_used"].add(log_data["agent_name"])
+            if log_data.get("tool_name"):
+                self.session_metadata["tools_called"].add(log_data["tool_name"])
+            if log_data.get("server_name"):
+                self.session_metadata["servers_connected"].add(log_data["server_name"])
+            if log_data.get("user_id"):
+                user_interaction = {
+                    "user_id": log_data["user_id"],
+                    "timestamp": log_data["timestamp"],
+                    "message": log_data.get("message", ""),
+                    "channel_id": log_data.get("channel_id"),
+                }
+                self.session_metadata["user_interactions"].append(user_interaction)
+
+    def finalize_session(self) -> bool:
+        """Write the complete session log to Supabase as a single record"""
+        try:
+            self._initialize_client()
+
+            if not self.client_initialized or not self.supabase_client:
+                return False
+
+            # Ensure the session_logs table exists
+            self._ensure_session_logs_table_exists()
+
+            # Convert sets to lists for JSON serialization
+            metadata = dict(self.session_metadata)
+            metadata["agents_used"] = list(metadata["agents_used"])
+            metadata["tools_called"] = list(metadata["tools_called"])
+            metadata["servers_connected"] = list(metadata["servers_connected"])
+
+            # Create the session record
+            session_record = {
+                "session_id": str(self.session_id),
+                "project_id": self.project_id,
+                "start_time": self.session_start_time.isoformat(),
+                "end_time": datetime.now().isoformat(),
+                "total_logs": len(self.session_logs),
+                "session_metadata": metadata,
+                "logs": self.session_logs,  # All logs as JSON array
+                "created_at": datetime.now().isoformat(),
+            }
+
+            # Insert the session record
+            result = (
+                self.supabase_client.table("session_logs")
+                .insert(session_record)
+                .execute()
+            )
+
+            if result.data:
+                print(
+                    f"✅ Session {self.session_id} saved with {len(self.session_logs)} logs"
+                )
+                return True
+            else:
+                print(f"⚠️ Failed to save session {self.session_id}")
+                return False
+
+        except Exception as e:
+            print(f"⚠️ Error finalizing session {self.session_id}: {e}")
+            return False
+
+    def _ensure_session_logs_table_exists(self):
+        """Ensure the session_logs table exists in Supabase"""
+        try:
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS session_logs (
+                id BIGSERIAL PRIMARY KEY,
+                session_id UUID NOT NULL UNIQUE,
+                project_id TEXT NOT NULL,
+                start_time TIMESTAMPTZ NOT NULL,
+                end_time TIMESTAMPTZ NOT NULL,
+                total_logs INTEGER NOT NULL DEFAULT 0,
+                session_metadata JSONB DEFAULT '{}',
+                logs JSONB DEFAULT '[]',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                
+                -- Indexes for better query performance
+                INDEX (session_id),
+                INDEX (project_id),
+                INDEX (start_time),
+                INDEX ((session_metadata->>'error_count')),
+                INDEX ((session_metadata->>'agents_used'))
+            );
+            """
+
+            self.supabase_client.rpc("exec_sql", {"sql": create_table_sql}).execute()
+
+        except Exception as e:
+            # Table creation might fail if rpc function doesn't exist, that's ok
+            pass
+
+
+class SupabaseSessionLogHandler(logging.Handler):
+    """Logging handler that aggregates logs by session instead of individual records"""
+
+    def __init__(self, project_id: str, session_id: Optional[uuid.UUID] = None):
+        super().__init__()
+        self.project_id = project_id
+        self.session_id = session_id or uuid.uuid4()
+
+        # Use session aggregator instead of individual log storage
+        self.session_aggregator = SessionLogAggregator(self.project_id, self.session_id)
+
+        # Still keep original functionality as backup
+        self.log_queue = queue.Queue()
+        self.supabase_client: Optional[Client] = None
+        self.client_initialized = False
+        self.batch_size = 50
+        self.batch_timeout = 10.0
+        self.pending_logs = []
+        self.last_batch_time = datetime.now()
+
+        self._load_supabase_credentials()
+
+        # Background thread for processing (optional - for backup logging)
+        self.background_thread = threading.Thread(
+            target=self._background_processor, daemon=True
+        )
+        self.background_thread.start()
+
+    def _load_supabase_credentials(self):
+        """Load Supabase credentials from secrets file"""
+        try:
+            current_dir = Path.cwd()
+            secrets_file = None
+
+            while current_dir != current_dir.parent:
+                for filename in ["mcp_agent.secrets.yaml", "mcp-agent.secrets.yaml"]:
+                    potential_file = current_dir / filename
+                    if potential_file.exists():
+                        secrets_file = potential_file
+                        break
+                if secrets_file:
+                    break
+                current_dir = current_dir.parent
+
+            if secrets_file:
+                with open(secrets_file, "r") as f:
+                    secrets = yaml.safe_load(f)
+
+                supabase_config = secrets.get("supabase", {})
+                self.supabase_url = supabase_config.get("url")
+                self.supabase_service_key = supabase_config.get("service_role_key")
+
+                if self.supabase_url and self.supabase_service_key:
+                    print(f"✅ Loaded Supabase credentials from {secrets_file}")
+                else:
+                    print(f"⚠️ Incomplete Supabase credentials in {secrets_file}")
+            else:
+                print("⚠️ No secrets file found for Supabase credentials")
+
+        except Exception as e:
+            print(f"⚠️ Error loading Supabase credentials: {e}")
+
     def emit(self, record: logging.LogRecord):
-        """Called by Python logging system to handle log records"""
+        """Called by Python logging system - now aggregates logs by session"""
         try:
             # Filter out noisy logs
             if self._should_filter_log(record):
@@ -105,7 +270,6 @@ class SupabaseLogHandler(logging.Handler):
 
             # Convert log record to structured format
             log_data = {
-                "session_id": str(self.session_id),
                 "level": record.levelname,
                 "timestamp": datetime.fromtimestamp(record.created).isoformat(),
                 "namespace": record.name,
@@ -119,19 +283,36 @@ class SupabaseLogHandler(logging.Handler):
                 "execution_time_ms": getattr(record, "execution_time_ms", None),
             }
 
-            # Add to queue for background processing
-            self.log_queue.put(log_data, block=False)
+            # Add to session aggregator (primary method)
+            self.session_aggregator.add_log(log_data)
+
+            # Also add to queue for backup individual logging (optional)
+            # self.log_queue.put(log_data, block=False)
 
         except Exception as e:
-            # Fallback to console if Supabase logging fails
-            print(f"⚠️ Supabase logging error: {e}")
+            print(f"⚠️ Session logging error: {e}")
             print(f"Original log: {record.levelname} - {record.getMessage()}")
+
+    def finalize_session(self) -> bool:
+        """Call this when the session ends to write all logs as one record"""
+        return self.session_aggregator.finalize_session()
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """Get current session statistics"""
+        return {
+            "session_id": str(self.session_id),
+            "total_logs": len(self.session_aggregator.session_logs),
+            "start_time": self.session_aggregator.session_start_time.isoformat(),
+            "metadata": dict(self.session_aggregator.session_metadata),
+        }
 
     def _should_filter_log(self, record: logging.LogRecord) -> bool:
         """Filter out noisy logs that clutter the database - AGGRESSIVE filtering"""
 
-        # Only allow logs from our SlackMetaAgent and critical errors
-        if record.name == "SlackMetaAgent":
+        # Allow logs from our app loggers and critical errors
+        if record.name in ["SlackMetaAgent", "mcp_agent"] or record.name.startswith(
+            "mcp_agent."
+        ):
             return False  # Always allow our app logs
 
         # Allow critical errors from any source
@@ -141,9 +322,7 @@ class SupabaseLogHandler(logging.Handler):
         # Block everything else during startup (very aggressive)
         message = record.getMessage()
 
-        # Block all MCP framework noise
-        if record.name == "mcp_agent":
-            return True
+        # Skip the mcp_agent filter since we allow it above
 
         # Block all HTTP/networking noise
         if record.name in [
@@ -329,6 +508,48 @@ class SupabaseLogHandler(logging.Handler):
             pass
 
 
+# Keep original handler for backward compatibility
+class SupabaseLogHandler(SupabaseSessionLogHandler):
+    """Original handler - now extends session handler but with individual logging enabled"""
+
+    def __init__(self, project_id: str, session_id: Optional[uuid.UUID] = None):
+        super().__init__(project_id, session_id)
+        # Enable individual logging for backward compatibility
+        self.use_individual_logging = True
+
+    def emit(self, record: logging.LogRecord):
+        """Override to also do individual logging"""
+        # Call parent's session aggregation
+        super().emit(record)
+
+        # Also do individual logging if enabled
+        if self.use_individual_logging:
+            try:
+                if self._should_filter_log(record):
+                    return
+
+                log_data = {
+                    "session_id": str(self.session_id),
+                    "level": record.levelname,
+                    "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+                    "namespace": record.name,
+                    "message": record.getMessage(),
+                    "data": self._extract_structured_data(record),
+                    "user_id": getattr(record, "user_id", None),
+                    "channel_id": getattr(record, "channel_id", None),
+                    "agent_name": getattr(record, "agent_name", None),
+                    "server_name": getattr(record, "server_name", None),
+                    "tool_name": getattr(record, "tool_name", None),
+                    "execution_time_ms": getattr(record, "execution_time_ms", None),
+                }
+
+                # Add to queue for individual logging
+                self.log_queue.put(log_data, block=False)
+
+            except Exception as e:
+                print(f"⚠️ Individual logging error: {e}")
+
+
 class FilteredConsoleHandler(logging.StreamHandler):
     """Console handler that filters out noisy logs"""
 
@@ -353,9 +574,23 @@ class FilteredConsoleHandler(logging.StreamHandler):
 
 
 def setup_supabase_logging(
-    project_id: str, session_id: Optional[uuid.UUID] = None, level: str = "INFO"
+    project_id: str,
+    session_id: Optional[uuid.UUID] = None,
+    level: str = "INFO",
+    use_session_aggregation: bool = True,
 ):
-    """Setup logging to send to Supabase instead of local files - ULTRA CLEAN"""
+    """Setup logging to send to Supabase with option for session aggregation
+
+    Args:
+        project_id: Supabase project ID
+        session_id: Optional session UUID
+        level: Logging level
+        use_session_aggregation: If True, aggregates all logs into one session record.
+                                If False, uses individual log records.
+
+    Returns:
+        tuple: (session_id, supabase_handler)
+    """
 
     # FIRST: Set root logger to ERROR level to silence ALL framework noise
     root_logger = logging.getLogger()
@@ -369,9 +604,15 @@ def setup_supabase_logging(
     if session_id is None:
         session_id = uuid.uuid4()
 
-    # Create and configure the Supabase handler (for database storage)
-    supabase_handler = SupabaseLogHandler(project_id, session_id)
-    supabase_handler.setLevel(logging.INFO)  # Store all app logs
+    # Choose handler type based on preference
+    if use_session_aggregation:
+        supabase_handler = SupabaseSessionLogHandler(project_id, session_id)
+        print(f"📝 Using session-aggregated logging (session: {session_id})")
+    else:
+        supabase_handler = SupabaseLogHandler(project_id, session_id)
+        print(f"📝 Using individual log records (session: {session_id})")
+
+    supabase_handler.setLevel(logging.INFO)
 
     # Create formatter for structured logging
     formatter = logging.Formatter(
@@ -388,10 +629,14 @@ def setup_supabase_logging(
     root_logger.addHandler(supabase_handler)
     root_logger.addHandler(console_handler)
 
-    # NOW set SlackMetaAgent logger to INFO level (it will bypass the root level filtering)
+    # Set our app loggers to INFO level (they will bypass the root level filtering)
     slack_logger = logging.getLogger("SlackMetaAgent")
     slack_logger.setLevel(logging.INFO)
     slack_logger.propagate = True  # Allow it to reach our handlers
 
-    # Silent logging initialization
+    # Also set mcp_agent loggers to INFO level to capture bot activity
+    mcp_logger = logging.getLogger("mcp_agent")
+    mcp_logger.setLevel(logging.INFO)
+    mcp_logger.propagate = True
+
     return session_id, supabase_handler
