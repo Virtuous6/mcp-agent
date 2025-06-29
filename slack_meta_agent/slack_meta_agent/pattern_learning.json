@@ -1,0 +1,88 @@
+{
+  "weather": {
+    "keywords": [
+      "weather",
+      "temperature",
+      "forecast",
+      "climate",
+      "temp",
+      "rain",
+      "sunny",
+      "cloudy"
+    ],
+    "agent": "data_researcher",
+    "confidence": 0.9,
+    "usage_count": 0
+  },
+  "knowledge": {
+    "keywords": [
+      "what is",
+      "who is",
+      "what does",
+      "define",
+      "explain",
+      "capital of",
+      "meaning of"
+    ],
+    "agent": "knowledge_agent",
+    "confidence": 0.85,
+    "usage_count": 0
+  },
+  "capabilities": {
+    "keywords": [
+      "what tools",
+      "what can you",
+      "capabilities",
+      "what do you have access",
+      "help",
+      "commands"
+    ],
+    "agent": "capability_inspector",
+    "confidence": 0.9,
+    "usage_count": 0
+  },
+  "financial": {
+    "keywords": [
+      "dashboard",
+      "revenue",
+      "financial",
+      "profit",
+      "metrics",
+      "analytics",
+      "sales",
+      "kpi"
+    ],
+    "agent": "financial_analyst",
+    "confidence": 0.8,
+    "usage_count": 0
+  },
+  "development": {
+    "keywords": [
+      "code",
+      "deploy",
+      "develop",
+      "build",
+      "app",
+      "website",
+      "programming",
+      "github"
+    ],
+    "agent": "code_developer",
+    "confidence": 0.8,
+    "usage_count": 0
+  },
+  "automation": {
+    "keywords": [
+      "n8n",
+      "workflow",
+      "automate",
+      "trigger",
+      "airtable",
+      "automation",
+      "zapier"
+    ],
+    "agent": "automation_specialist",
+    "confidence": 0.85,
+    "usage_count": 0
+  }
+}

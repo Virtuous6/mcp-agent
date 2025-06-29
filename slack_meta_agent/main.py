@@ -1,10 +1,14 @@
+# ULTRA CLEAN STARTUP: Configure logging FIRST before any imports
+import logging
+import os
+
+# Set root logger to ERROR level IMMEDIATELY to silence framework noise
+logging.getLogger().setLevel(logging.ERROR)
+
 import asyncio
 import json
-import os
-import uuid
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
-import logging
 from datetime import datetime, timedelta
 
 from mcp_agent.app import MCPApp
@@ -260,6 +264,8 @@ class SlackMetaAgent:
     async def _discover_available_tools(self) -> Dict[str, Dict]:
         """Dynamically discover all available tools from connected MCP servers"""
         self.logger.info("🔍 Discovering available tools from MCP servers...")
+        import asyncio
+
         discovered_tools = {}
 
         for agent_type, spec in self.agent_registry.items():
@@ -276,7 +282,7 @@ class SlackMetaAgent:
             agent_tools = {}
             for server_name in spec.server_names:
                 try:
-                    # Create temporary agent to discover tools
+                    # Create temporary agent to discover tools with timeout
                     temp_agent = Agent(
                         name=f"discovery_{server_name}",
                         instruction="Tool discovery agent",
@@ -284,8 +290,13 @@ class SlackMetaAgent:
                     )
 
                     async with temp_agent:
-                        tools_result = await temp_agent.list_tools(server_name)
-                        capabilities = await temp_agent.get_capabilities(server_name)
+                        # Add timeout for individual server discovery
+                        tools_result = await asyncio.wait_for(
+                            temp_agent.list_tools(server_name), timeout=10.0
+                        )
+                        capabilities = await asyncio.wait_for(
+                            temp_agent.get_capabilities(server_name), timeout=5.0
+                        )
 
                         agent_tools[server_name] = {
                             "tools": [
@@ -304,10 +315,22 @@ class SlackMetaAgent:
                             else {},
                         }
 
-                        self.logger.info(
-                            f"✅ Discovered {len(agent_tools[server_name]['tools'])} tools from {server_name}"
-                        )
+                        # Only log if significant number of tools discovered
+                        tool_count = len(agent_tools[server_name]["tools"])
+                        if tool_count > 5:  # Only log if meaningful discovery
+                            self.logger.info(
+                                f"✅ Discovered {tool_count} tools from {server_name}"
+                            )
 
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        f"⚠️  Tool discovery timed out for {server_name}"
+                    )
+                    agent_tools[server_name] = {
+                        "tools": [],
+                        "capabilities": {},
+                        "error": f"Timeout connecting to {server_name}",
+                    }
                 except Exception as e:
                     self.logger.warning(
                         f"⚠️  Could not discover tools for {server_name}: {e}"
@@ -325,8 +348,12 @@ class SlackMetaAgent:
                 "capabilities": spec.capabilities,
             }
 
+        # Log discovery summary only
+        total_servers = sum(
+            len(info.get("servers", [])) for info in discovered_tools.values()
+        )
         self.logger.info(
-            f"🎯 Tool discovery complete: {len(discovered_tools)} agent types analyzed"
+            f"🎯 Discovery complete: {len(discovered_tools)} agents, {total_servers} servers"
         )
         return discovered_tools
 
@@ -360,7 +387,8 @@ class SlackMetaAgent:
                 await agent.__aenter__()
                 self.agent_pool[agent_type] = agent
 
-                self.logger.info(f"✅ Initialized pooled {agent_type} agent")
+                # Reduced logging verbosity during startup
+                pass  # self.logger.info(f"✅ Initialized pooled {agent_type} agent")
 
             except Exception as e:
                 self.logger.warning(f"Could not initialize {agent_type}: {e}")
@@ -402,7 +430,7 @@ class SlackMetaAgent:
         if agent_type in self.agent_pool:
             try:
                 await self.agent_pool[agent_type].__aexit__(None, None, None)
-            except:
+            except:  # noqa: E722
                 pass  # Ignore cleanup errors
             del self.agent_pool[agent_type]
 
@@ -1908,7 +1936,7 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
         # Clean up Supabase logging
         if self.supabase_log_handler:
             try:
-                await self.supabase_log_handler.close()
+                self.supabase_log_handler.close()
             except Exception as e:
                 print(f"⚠️ Could not clean up Supabase logging: {e}")
 
@@ -2125,6 +2153,8 @@ class MetaAgent(SlackMetaAgent):
 async def main():
     """Main function to run the Slack Meta-Agent system"""
     # Load configuration
+    from pathlib import Path
+
     secrets_file = Path(__file__).parent / "mcp_agent.secrets.yaml"
 
     if not secrets_file.exists():
@@ -2156,8 +2186,7 @@ async def main():
         project_id=supabase_project_id, level="INFO"
     )
 
-    print(f"🗂️ Supabase logging active - Session: {session_id}")
-    print("💾 All logs now stored in Supabase instead of local files")
+    print(f"🗂️ Logging Session: {session_id}")
 
     # Initialize the Meta-Agent system
     async with app.run() as agent_app:
@@ -2176,27 +2205,47 @@ async def main():
             # Initialize Slack integration
             await meta_agent.initialize_slack(bot_token, app_token)
 
-            # 🚀 Simple performance optimizations
-            logger.info("🚀 Initializing performance optimizations...")
+            # 🚀 Simple performance optimizations - log as single summary
+            startup_results = {
+                "tool_cache": "pending",
+                "agent_pool": "pending",
+                "optimizations": [
+                    "connection_pooling",
+                    "request_isolation",
+                    "pattern_routing",
+                    "persistent_learning",
+                ],
+            }
 
-            # Pre-populate tool cache on startup
-            logger.info("📊 Pre-populating tool discovery cache...")
+            # Pre-populate tool cache on startup with timeout
             try:
-                await meta_agent._get_cached_tools()  # This will populate the cache
-                logger.info("✅ Tool discovery cache populated")
-            except Exception as e:
-                logger.warning(
-                    f"⚠️  Tool cache population failed (will work on-demand): {e}"
-                )
+                # Add timeout to prevent hanging
+                import asyncio
 
-            # Initialize connection-pooled agents
-            try:
-                await meta_agent._initialize_agent_pool()
-                logger.info("✅ Connection pool initialized")
+                await asyncio.wait_for(
+                    meta_agent._get_cached_tools(), timeout=30.0
+                )  # 30 second timeout
+                startup_results["tool_cache"] = "success"
+            except asyncio.TimeoutError:
+                startup_results["tool_cache"] = "timeout"
             except Exception as e:
-                logger.warning(
-                    f"⚠️  Agent pool initialization failed (will create on-demand): {e}"
+                startup_results["tool_cache"] = f"failed: {str(e)[:50]}"
+
+            # Initialize connection-pooled agents with timeout
+            try:
+                await asyncio.wait_for(
+                    meta_agent._initialize_agent_pool(), timeout=30.0
                 )
+                startup_results["agent_pool"] = "success"
+            except asyncio.TimeoutError:
+                startup_results["agent_pool"] = "timeout"
+            except Exception as e:
+                startup_results["agent_pool"] = f"failed: {str(e)[:50]}"
+
+            # Single comprehensive startup log
+            logger.info(
+                f"🚀 Ready - Cache: {startup_results['tool_cache']}, Pool: {startup_results['agent_pool']}"
+            )
 
             # Test database insertion only if TEST_DB environment variable is set
             if os.getenv("TEST_DB", "false").lower() in ["true", "1", "yes"]:
@@ -2238,32 +2287,14 @@ async def main():
 
             logger.info("💡 Skipping dynamic routing startup test for faster boot")
 
-            # 📈 System optimizations active:
-            logger.info("🎯 📈 SYSTEM OPTIMIZATIONS ACTIVE:")
-            logger.info("   🔄 Connection Pooling (persistent MCP connections)")
-            logger.info("   🔒 Request-level Conversation Isolation (secure)")
-            logger.info("   ⚡ Pattern-based Fast Routing (bypasses LLM)")
-            logger.info("   📚 Persistent Learning (patterns saved to file)")
-            logger.info("   🔄 Connection Health Monitoring (auto-recovery)")
-            logger.info("   📊 30-minute Tool Discovery Cache")
-            logger.info("   🗂️ Supabase Log Storage (no more local log files)")
-            logger.info("")
-            logger.info(
-                "   Expected performance: Weather ~1-3s, Complex requests ~5-15s"
-            )
-            logger.info("   Security: ✅ Request isolation, ✅ No shared state")
-            logger.info(f"   Logging: ✅ Session {session_id} → Supabase")
+            # Brief optimization summary
+            logger.info("🎯 Optimizations: Pooling, Caching, Pattern Routing, Learning")
 
             # Start the WebSocket connection
             await meta_agent.start_slack_connection()
 
             # Keep the connection alive
-            logger.info("🤖 Meta-Agent is running! Send messages in Slack...")
-            logger.info("📱 Try mentioning @meta-agent in a channel or DM!")
-            logger.info(
-                "💡 Example: @meta-agent Create Q4 revenue dashboard for SaaS metrics"
-            )
-            logger.info("⚠️  Press Ctrl+C to stop")
+            logger.info("🤖 Meta-Agent ready! Mention @meta-agent in Slack")
 
             while True:
                 await asyncio.sleep(1)
@@ -2283,7 +2314,7 @@ async def main():
             # Clean up on error too
             try:
                 await meta_agent.cleanup()
-            except:
+            except:  # noqa: E722
                 pass
 
             raise

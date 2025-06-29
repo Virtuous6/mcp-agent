@@ -2,14 +2,15 @@ $schema: ../schema/mcp-agent.config.schema.json
 
 execution_engine: asyncio
 logger:
-  transports: [console, file]
+  transports: [console] # Only console logging - Supabase logging handled separately
   level: info
   show_progress: true
-  path: "logs/meta-agent.jsonl"
-  path_settings:
-    path_pattern: "logs/meta-agent-{unique_id}.jsonl"
-    unique_id: "timestamp"
-    timestamp_format: "%Y%m%d_%H%M%S"
+  # Disabled file logging since we use Supabase logging instead
+  # path: "logs/meta-agent.jsonl"
+  # path_settings:
+  #   path_pattern: "logs/meta-agent-{unique_id}.jsonl"
+  #   unique_id: "timestamp"
+  #   timestamp_format: "%Y%m%d_%H%M%S"
 
 mcp:
   servers:
