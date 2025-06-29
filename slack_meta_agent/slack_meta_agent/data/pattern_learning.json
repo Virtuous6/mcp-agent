@@ -156,13 +156,60 @@
       "issue with",
       "problem with",
       "bug report",
-      "feature request",
-      "add this feedback",
-      "leave feedback",
-      "submit feedback"
+      "feature request"
     ],
     "agent": "feedback_collector",
     "confidence": 0.9,
+    "usage_count": 2
+  },
+  "data_researcher": {
+    "keywords": [
+      "right",
+      "what",
+      "<@u0933uc9qeb>",
+      "charleston,",
+      "weather",
+      "now?",
+      "this",
+      "note",
+      "devs:",
+      "feedback",
+      "aware!"
+    ],
+    "agent": "data_researcher",
+    "confidence": 0.7,
+    "usage_count": 0
+  },
+  "airtable_manager": {
+    "keywords": [
+      "airtable?",
+      "have",
+      "bases",
+      "what",
+      "<@u0933uc9qeb>"
+    ],
+    "agent": "airtable_manager",
+    "confidence": 0.7,
+    "usage_count": 0
+  },
+  "feedback_collector": {
+    "keywords": [
+      "like",
+      "leave",
+      "some",
+      "feedback",
+      "<@u0933uc9qeb>",
+      "make",
+      "here",
+      "unicorn",
+      "sparkle",
+      "i've",
+      "please",
+      "gmail",
+      "have"
+    ],
+    "agent": "feedback_collector",
+    "confidence": 0.7,
     "usage_count": 0
   }
 }

@@ -44,18 +44,56 @@ class SessionLogAggregator:
     def _load_supabase_credentials(self):
         """Load Supabase credentials from secrets file"""
         try:
+            # First try the expected location: slack_meta_agent/config/mcp_agent.secrets.yaml
             current_dir = Path.cwd()
+
+            # Look for slack_meta_agent directory structure first
+            slack_meta_agent_dir = None
+            if current_dir.name == "slack_meta_agent":
+                slack_meta_agent_dir = current_dir
+            else:
+                # Check if we're in a subdirectory of slack_meta_agent
+                for parent in current_dir.parents:
+                    if parent.name == "slack_meta_agent":
+                        slack_meta_agent_dir = parent
+                        break
+
+                # Check if slack_meta_agent is a subdirectory of current directory
+                if not slack_meta_agent_dir:
+                    potential_slack_dir = current_dir / "slack_meta_agent"
+                    if potential_slack_dir.exists():
+                        slack_meta_agent_dir = potential_slack_dir
+
             secrets_file = None
 
-            while current_dir != current_dir.parent:
-                for filename in ["mcp_agent.secrets.yaml", "mcp-agent.secrets.yaml"]:
-                    potential_file = current_dir / filename
-                    if potential_file.exists():
-                        secrets_file = potential_file
+            # If we found slack_meta_agent directory, look in config subdirectory
+            if slack_meta_agent_dir:
+                config_dir = slack_meta_agent_dir / "config"
+                if config_dir.exists():
+                    for filename in [
+                        "mcp_agent.secrets.yaml",
+                        "mcp-agent.secrets.yaml",
+                    ]:
+                        potential_file = config_dir / filename
+                        if potential_file.exists():
+                            secrets_file = potential_file
+                            break
+
+            # Fallback: search in current directory and parents (original behavior)
+            if not secrets_file:
+                search_dir = current_dir
+                while search_dir != search_dir.parent:
+                    for filename in [
+                        "mcp_agent.secrets.yaml",
+                        "mcp-agent.secrets.yaml",
+                    ]:
+                        potential_file = search_dir / filename
+                        if potential_file.exists():
+                            secrets_file = potential_file
+                            break
+                    if secrets_file:
                         break
-                if secrets_file:
-                    break
-                current_dir = current_dir.parent
+                    search_dir = search_dir.parent
 
             if secrets_file:
                 with open(secrets_file, "r") as f:
@@ -230,18 +268,56 @@ class SupabaseSessionLogHandler(logging.Handler):
     def _load_supabase_credentials(self):
         """Load Supabase credentials from secrets file"""
         try:
+            # First try the expected location: slack_meta_agent/config/mcp_agent.secrets.yaml
             current_dir = Path.cwd()
+
+            # Look for slack_meta_agent directory structure first
+            slack_meta_agent_dir = None
+            if current_dir.name == "slack_meta_agent":
+                slack_meta_agent_dir = current_dir
+            else:
+                # Check if we're in a subdirectory of slack_meta_agent
+                for parent in current_dir.parents:
+                    if parent.name == "slack_meta_agent":
+                        slack_meta_agent_dir = parent
+                        break
+
+                # Check if slack_meta_agent is a subdirectory of current directory
+                if not slack_meta_agent_dir:
+                    potential_slack_dir = current_dir / "slack_meta_agent"
+                    if potential_slack_dir.exists():
+                        slack_meta_agent_dir = potential_slack_dir
+
             secrets_file = None
 
-            while current_dir != current_dir.parent:
-                for filename in ["mcp_agent.secrets.yaml", "mcp-agent.secrets.yaml"]:
-                    potential_file = current_dir / filename
-                    if potential_file.exists():
-                        secrets_file = potential_file
+            # If we found slack_meta_agent directory, look in config subdirectory
+            if slack_meta_agent_dir:
+                config_dir = slack_meta_agent_dir / "config"
+                if config_dir.exists():
+                    for filename in [
+                        "mcp_agent.secrets.yaml",
+                        "mcp-agent.secrets.yaml",
+                    ]:
+                        potential_file = config_dir / filename
+                        if potential_file.exists():
+                            secrets_file = potential_file
+                            break
+
+            # Fallback: search in current directory and parents (original behavior)
+            if not secrets_file:
+                search_dir = current_dir
+                while search_dir != search_dir.parent:
+                    for filename in [
+                        "mcp_agent.secrets.yaml",
+                        "mcp-agent.secrets.yaml",
+                    ]:
+                        potential_file = search_dir / filename
+                        if potential_file.exists():
+                            secrets_file = potential_file
+                            break
+                    if secrets_file:
                         break
-                if secrets_file:
-                    break
-                current_dir = current_dir.parent
+                    search_dir = search_dir.parent
 
             if secrets_file:
                 with open(secrets_file, "r") as f:

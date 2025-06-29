@@ -8,6 +8,9 @@ agent framework that can dynamically orchestrate specialized agents to solve com
 __version__ = "1.0.0"
 __author__ = "Your Name"
 
-from .core.meta_agent import SlackMetaAgent, MetaAgent
+from .core.meta_agent import SlackMetaAgent
+
+# Backward compatibility alias
+MetaAgent = SlackMetaAgent
 
 __all__ = ["SlackMetaAgent", "MetaAgent"]

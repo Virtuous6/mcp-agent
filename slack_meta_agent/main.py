@@ -26,19 +26,13 @@ from supabase_logger import setup_supabase_logging
 from supabase_config_loader import get_settings_from_database, DatabaseConfig
 
 # Import universal MCP exploration strategy
-import sys
-import os
-
-sys.path.append(
-    os.path.dirname(os.path.dirname(__file__))
-)  # Add parent directory to path
-from slack_meta_agent.universal_mcp_strategy import (
+from universal_mcp_strategy import (
     explore_any_mcp_server,
     print_exploration_results,
 )
 
 # Direct Supabase client for reliability
-from supabase_direct_client import SupabaseDirectClient
+from src.slack_meta_agent.database.supabase_client import SupabaseDirectClient
 
 # Slack integration imports
 try:
