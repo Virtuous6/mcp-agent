@@ -211,5 +211,22 @@
     "agent": "feedback_collector",
     "confidence": 0.7,
     "usage_count": 0
+  },
+  "project_manager": {
+    "keywords": [
+      "from",
+      "rows",
+      "pull",
+      "<@u0933uc9qeb>",
+      "supabase?",
+      "have?",
+      "supabase",
+      "projects",
+      "does",
+      "what"
+    ],
+    "agent": "project_manager",
+    "confidence": 0.7,
+    "usage_count": 0
   }
 }

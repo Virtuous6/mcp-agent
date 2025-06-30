@@ -819,6 +819,22 @@ class SlackMetaAgent:
         """Advanced dynamic pattern matching with adaptive confidence and contextual analysis"""
         message_lower = message.lower()
 
+        # CHECK: Avoid pattern matching for organization-qualified requests
+        # These should be handled by dynamic discovery instead
+        org_service_patterns = [
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(supabase|database|db|airtable|n8n|api|webhook|integration|server|service)\b"
+        ]
+        has_org_qualifier = any(
+            re.search(pattern, message, re.IGNORECASE)
+            for pattern in org_service_patterns
+        )
+
+        if has_org_qualifier:
+            self.logger.info(
+                f"⚠️ Skipping pattern matching for organization-qualified request: {message[:50]}..."
+            )
+            return None
+
         best_match = None
         best_confidence = 0.0
 
@@ -1628,7 +1644,51 @@ class SlackMetaAgent:
                     "requires_tools": [],
                 }
 
-            # 🚀 SECOND: Dynamic pattern matching (bypass LLM for common requests)
+            # 🎯 SECOND: Check if we need dynamic MCP server discovery for organization-qualified servers (NEW PRIORITY)
+            # This needs to happen BEFORE pattern matching to avoid generic supabase/airtable patterns intercepting qualified requests
+            message_keywords = self._extract_discovery_keywords_from_message(message)
+
+            # Check for organization-qualified patterns specifically (e.g., "ARC supabase", "ACME airtable")
+            has_org_qualifier = any("_" in keyword for keyword in message_keywords)
+            org_service_patterns = [
+                r"\b(?:our\s+)?([A-Z]{2,10})\s+(supabase|database|db|airtable|n8n|api|webhook|integration|server|service)\b"
+            ]
+            has_explicit_org_pattern = any(
+                re.search(pattern, message, re.IGNORECASE)
+                for pattern in org_service_patterns
+            )
+
+            if has_org_qualifier or has_explicit_org_pattern:
+                needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
+                    message, message_keywords
+                )
+
+                if needs_dynamic_discovery:
+                    self.logger.info(
+                        f"🎯 PRIORITY: Organization-qualified service detected: {message[:50]}... keywords: {message_keywords}"
+                    )
+
+                    # Select appropriate agent type for the discovered tools
+                    agent_type = (
+                        "data_researcher"  # This agent can work with any MCP tools
+                    )
+
+                    return {
+                        "required_agents": [agent_type],
+                        "complexity": "dynamic",
+                        "estimated_tasks": 1,
+                        "execution_strategy": "dynamic_discovery",
+                        "priority": "high",
+                        "task_description": f"Dynamic MCP discovery for organization-qualified services",
+                        "reasoning": f"Detected organization-qualified service requiring database server lookup",
+                        "intent_name": f"dynamic_discovery_{agent_type}",
+                        "confidence": "high",
+                        "requires_tools": [],
+                        "discovery_keywords": message_keywords,
+                        "qualified_services": True,
+                    }
+
+            # 🚀 THIRD: Dynamic pattern matching (moved after org-qualified check)
             pattern_match = self._dynamic_pattern_match(message)
             if pattern_match:
                 agent_type = pattern_match["agent"]
@@ -1655,36 +1715,38 @@ class SlackMetaAgent:
                     "matched_keywords": matched_keywords,
                 }
 
-            # 🔍 THIRD: Check if we need dynamic MCP server discovery (after pattern matching)
-            message_keywords = self._extract_discovery_keywords_from_message(message)
-            needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
-                message, message_keywords
-            )
-
-            if needs_dynamic_discovery:
-                self.logger.info(
-                    f"🎯 PRIORITY: Dynamic MCP discovery detected for: {message[:50]}... keywords: {message_keywords}"
+            # 🔍 FOURTH: Check if we need dynamic MCP server discovery (for non-org-qualified requests)
+            if not has_org_qualifier and not has_explicit_org_pattern:
+                needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
+                    message, message_keywords
                 )
 
-                # Select appropriate agent type for the discovered tools
-                agent_type = "data_researcher"  # This agent can work with any MCP tools
+                if needs_dynamic_discovery:
+                    self.logger.info(
+                        f"🔍 Dynamic MCP discovery detected for: {message[:50]}... keywords: {message_keywords}"
+                    )
 
-                return {
-                    "required_agents": [agent_type],
-                    "complexity": "dynamic",
-                    "estimated_tasks": 1,
-                    "execution_strategy": "dynamic_discovery",
-                    "priority": "high",
-                    "task_description": f"Dynamic MCP discovery for qualified services",
-                    "reasoning": f"Detected qualified service patterns requiring database server discovery",
-                    "intent_name": f"dynamic_discovery_{agent_type}",
-                    "confidence": "high",
-                    "requires_tools": [],
-                    "discovery_keywords": message_keywords,
-                    "qualified_services": True,
-                }
+                    # Select appropriate agent type for the discovered tools
+                    agent_type = (
+                        "data_researcher"  # This agent can work with any MCP tools
+                    )
 
-            # 🤖 FOURTH: Fall back to LLM routing for complex/ambiguous requests
+                    return {
+                        "required_agents": [agent_type],
+                        "complexity": "dynamic",
+                        "estimated_tasks": 1,
+                        "execution_strategy": "dynamic_discovery",
+                        "priority": "high",
+                        "task_description": f"Dynamic MCP discovery for qualified services",
+                        "reasoning": f"Detected service patterns requiring database server discovery",
+                        "intent_name": f"dynamic_discovery_{agent_type}",
+                        "confidence": "high",
+                        "requires_tools": [],
+                        "discovery_keywords": message_keywords,
+                        "qualified_services": False,
+                    }
+
+            # 🤖 FIFTH: Fall back to LLM routing for complex/ambiguous requests
             self.logger.info(f"🤖 Using LLM routing for: {message[:50]}...")
 
             # Get fresh tool discovery (with caching)

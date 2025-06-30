@@ -29,6 +29,17 @@ def test_enhanced_pattern_matching():
 
         # Test cases with varying complexity and patterns
         test_cases = [
+            # Organization-qualified server test case (NEW - Testing our fix!)
+            {
+                "message": "Can you use the ARC Supabase to check project status?",
+                "expected_pattern": None,  # Should NOT match any pattern - should go to dynamic discovery
+                "description": "Organization-qualified server request (ARC Supabase)",
+            },
+            {
+                "message": "Connect to the ARC Supabase database",
+                "expected_pattern": None,  # Should NOT match any pattern - should go to dynamic discovery
+                "description": "ARC organization Supabase connection request",
+            },
             # Feedback test cases (should get higher confidence now)
             {
                 "message": "I'd like to give feedback on the system",
