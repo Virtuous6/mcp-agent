@@ -1644,7 +1644,40 @@ class SlackMetaAgent:
                     "requires_tools": [],
                 }
 
-            # 🎯 SECOND: Check if we need dynamic MCP server discovery for organization-qualified servers (NEW PRIORITY)
+            # 💬 SECOND: Check for feedback requests (high priority)
+            feedback_info = self._parse_feedback_from_message(message)
+            if feedback_info["has_feedback"] or any(
+                pattern in message.lower()
+                for pattern in [
+                    "give feedback",
+                    "provide feedback",
+                    "share feedback",
+                    "my feedback",
+                    "here is feedback",
+                    "here's feedback",
+                    "feedback on",
+                    "feedback about",
+                    "i want to give feedback",
+                ]
+            ):
+                self.logger.info(
+                    f"💬 PRIORITY: Feedback detected for: {message[:50]}..."
+                )
+
+                return {
+                    "required_agents": ["feedback_collector"],
+                    "complexity": "simple",
+                    "estimated_tasks": 1,
+                    "execution_strategy": "single_agent",
+                    "priority": "high",
+                    "task_description": "User feedback collection and storage",
+                    "reasoning": "Detected feedback collection request",
+                    "intent_name": "dynamic_feedback_collector",
+                    "confidence": "high",
+                    "requires_tools": [],
+                }
+
+            # 🎯 THIRD: Check if we need dynamic MCP server discovery for organization-qualified servers (NEW PRIORITY)
             # This needs to happen BEFORE pattern matching to avoid generic supabase/airtable patterns intercepting qualified requests
             message_keywords = self._extract_discovery_keywords_from_message(message)
 
@@ -1688,7 +1721,7 @@ class SlackMetaAgent:
                         "qualified_services": True,
                     }
 
-            # 🚀 THIRD: Dynamic pattern matching (moved after org-qualified check)
+            # 🚀 FOURTH: Dynamic pattern matching (moved after feedback and org-qualified check)
             pattern_match = self._dynamic_pattern_match(message)
             if pattern_match:
                 agent_type = pattern_match["agent"]
@@ -1715,7 +1748,7 @@ class SlackMetaAgent:
                     "matched_keywords": matched_keywords,
                 }
 
-            # 🔍 FOURTH: Check if we need dynamic MCP server discovery (for non-org-qualified requests)
+            # 🔍 FIFTH: Check if we need dynamic MCP server discovery (for non-org-qualified requests)
             if not has_org_qualifier and not has_explicit_org_pattern:
                 needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
                     message, message_keywords
@@ -1746,7 +1779,7 @@ class SlackMetaAgent:
                         "qualified_services": False,
                     }
 
-            # 🤖 FIFTH: Fall back to LLM routing for complex/ambiguous requests
+            # 🤖 SIXTH: Fall back to LLM routing for complex/ambiguous requests
             self.logger.info(f"🤖 Using LLM routing for: {message[:50]}...")
 
             # Get fresh tool discovery (with caching)
@@ -1784,6 +1817,7 @@ class SlackMetaAgent:
             - For weather/current events/real-time data, use "data_researcher"
             - For airtable/workflow/automation, use "automation_specialist" or "airtable_manager"
             - For adding/registering/configuring MCP servers, use "mcp_server_manager"
+            - For feedback/suggestions/complaints, use "feedback_collector"
             - Match the user's request to the actual tools available
             """
 
@@ -2273,9 +2307,11 @@ class SlackMetaAgent:
                 f"Error processing Slack message (took {execution_time:.2f}s): {e}"
             )
             if "channel_id" in locals() and "message_ts" in locals():
+                error_message = f"Sorry, I encountered an error: {str(e)}"
+                clean_error = self._clean_markdown_from_response(error_message)
                 await self.slack_manager.send_response(
                     channel_id,
-                    f"Sorry, I encountered an error: {str(e)}",
+                    clean_error,
                     thread_ts=message_ts,
                 )
 
@@ -2379,6 +2415,22 @@ class SlackMetaAgent:
 
         return clean_text
 
+    def _clean_markdown_from_response(self, response: str) -> str:
+        """Remove markdown formatting from responses to provide clean text"""
+        if not response:
+            return response
+
+        # Remove bold formatting **text** -> text
+        cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", response)
+
+        # Replace bullet points • with dashes
+        cleaned = cleaned.replace("•", "-")
+
+        # Replace multiple consecutive dashes with single dashes
+        cleaned = re.sub(r"^\s*-\s*-", "-", cleaned, flags=re.MULTILINE)
+
+        return cleaned
+
     async def _send_enhanced_slack_response(
         self,
         channel_id: str,
@@ -2438,14 +2490,17 @@ class SlackMetaAgent:
 *{routing_info} | Strategy: {safe_analysis.get("execution_strategy", "unknown")} | {pattern_info}*
 """
 
+            # Clean markdown from response before sending
+            clean_response = self._clean_markdown_from_response(formatted_response)
             await self.slack_manager.send_response(
-                channel_id, formatted_response, thread_ts
+                channel_id, clean_response, thread_ts
             )
 
         except Exception as e:
             self.logger.error(f"Error sending enhanced Slack response: {e}")
-            # Fallback to basic response with safe values
-            await self.slack_manager.send_response(channel_id, result, thread_ts)
+            # Fallback to basic response with safe values (also clean markdown)
+            clean_result = self._clean_markdown_from_response(result)
+            await self.slack_manager.send_response(channel_id, clean_result, thread_ts)
 
     def _get_routing_info(self, analysis: Dict) -> str:
         """Get routing information for display"""
@@ -2747,19 +2802,22 @@ class SlackMetaAgent:
             )
 
             # Format the human input request for Slack
-            formatted_message = f"""🤖 **Agent needs more information:**
+            formatted_message = f"""🤖 Agent needs more information:
 
 {request.prompt}
 
-💡 **Context:** {request.description or "Please provide the requested information."}
+💡 Context: {request.description or "Please provide the requested information."}
 
-*Reply in this thread to continue...*
+Reply in this thread to continue...
 """
+
+            # Clean markdown from the message before sending
+            clean_message = self._clean_markdown_from_response(formatted_message)
 
             # Send the human input request to Slack
             response = await self.slack_manager.send_response(
                 channel_id,
-                formatted_message,
+                clean_message,
                 self.current_thread_ts,
             )
 
@@ -2801,9 +2859,13 @@ class SlackMetaAgent:
                     del self.pending_human_inputs[user_id]
 
                 # Send timeout message to Slack
+                timeout_message = (
+                    "⏰ Request timed out - Please try your original request again."
+                )
+                clean_timeout = self._clean_markdown_from_response(timeout_message)
                 await self.slack_manager.send_response(
                     channel_id,
-                    "⏰ **Request timed out** - Please try your original request again.",
+                    clean_timeout,
                     self.current_thread_ts,
                 )
 
@@ -3553,14 +3615,14 @@ The server is now available for use! You can reference it in future requests.
             )
 
             if result["success"]:
-                return f"""✅ **Thank you for your feedback!**
+                return f"""✅ Thank you for your feedback!
 
 Your feedback has been recorded and will help us improve the system.
 
-**Feedback Summary:**
-• **Category:** {category.replace("_", " ").title()}
-• **Length:** {len(feedback_text)} characters
-• **Recorded:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+Feedback Summary:
+- Category: {category.replace("_", " ").title()}
+- Length: {len(feedback_text)} characters
+- Recorded: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
 Is there anything else you'd like to share or any other feedback you have?"""
             else:

@@ -12,7 +12,7 @@
     ],
     "agent": "data_researcher",
     "confidence": 0.9,
-    "usage_count": 0
+    "usage_count": 1
   },
   "knowledge": {
     "keywords": [
@@ -174,7 +174,16 @@
       "note",
       "devs:",
       "feedback",
-      "aware!"
+      "aware!",
+      "texas",
+      "austin",
+      "list.",
+      "let's",
+      "feecback",
+      "gmail,",
+      "some",
+      "google",
+      "here"
     ],
     "agent": "data_researcher",
     "confidence": 0.7,
@@ -186,7 +195,8 @@
       "have",
       "bases",
       "what",
-      "<@u0933uc9qeb>"
+      "<@u0933uc9qeb>",
+      "databases"
     ],
     "agent": "airtable_manager",
     "confidence": 0.7,
@@ -206,7 +216,11 @@
       "i've",
       "please",
       "gmail",
-      "have"
+      "have",
+      "part",
+      "want",
+      "donuts",
+      "system."
     ],
     "agent": "feedback_collector",
     "confidence": 0.7,
