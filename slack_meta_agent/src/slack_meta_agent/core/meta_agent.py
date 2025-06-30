@@ -63,7 +63,7 @@ class SlackMetaAgent:
         self.db_ops = SupabaseOperations(supabase_project_id)
         # self.intent_analyzer = IntentAnalyzer(self.config)  # Not using separate class, using original method
         self.slack_manager = SlackClientManager()
-        self.mcp_discovery = MCPServerDiscovery(mcp_app)
+        self.mcp_discovery = MCPServerDiscovery(mcp_app, supabase_project_id)
 
         # Core state
         self.conversation_states: Dict[str, ConversationState] = {}
@@ -3064,7 +3064,7 @@ class SlackMetaAgent:
         """Dynamically discover MCP servers from database based on query keywords"""
         try:
             self.logger.info(f"🔍 Dynamic MCP discovery for keywords: {query_keywords}")
-            return await self.mcp_discovery.discover_servers(query_keywords)
+            return await self.mcp_discovery.find_servers_by_keywords(query_keywords)
         except Exception as e:
             self.logger.warning(f"Dynamic MCP discovery failed: {e}")
             return []
@@ -4191,7 +4191,22 @@ Is there anything else you'd like to share or any other feedback you have?"""
     async def _find_best_server_match(
         self, keywords: List[str], message: str
     ) -> Optional[Dict[str, Any]]:
-        """Find the best server match from both configured servers and database with user disambiguation"""
+        """Find the best server match with ORGANIZATION+TOOL direct lookup priority"""
+
+        # 🎯 PRIORITY 1: Direct Organization + Tool Lookup
+        org_tool_match = await self._try_direct_organization_tool_lookup(
+            keywords, message
+        )
+        if org_tool_match:
+            self.logger.info(
+                f"🎯 Direct organization+tool match: '{org_tool_match['server_name']}' (source: {org_tool_match['source']})"
+            )
+            return org_tool_match
+
+        # 🔄 FALLBACK: Traditional scoring-based matching
+        self.logger.info(
+            "🔄 No direct organization+tool match found, falling back to scoring-based matching"
+        )
 
         # Get configured servers and score them
         configured_servers = []
@@ -4230,7 +4245,7 @@ Is there anything else you'd like to share or any other feedback you have?"""
         if not all_candidates:
             return None
 
-        # Sort by score (highest first)
+        # Simple sorting by score for fallback matching
         all_candidates.sort(key=lambda x: x["score"], reverse=True)
 
         # Check for ambiguity and ask user if needed
@@ -4239,65 +4254,166 @@ Is there anything else you'd like to share or any other feedback you have?"""
         )
 
         if disambiguation_result:
+            source_emoji = "🗄️" if disambiguation_result["source"] == "database" else "⚙️"
             self.logger.info(
-                f"🎯 User selected: {disambiguation_result['server_name']} (source: {disambiguation_result['source']}, score: {disambiguation_result['score']:.2f})"
+                f"🎯 User selected: {source_emoji} {disambiguation_result['server_name']} (source: {disambiguation_result['source']}, score: {disambiguation_result['score']:.2f})"
             )
             return disambiguation_result
 
-        # If no disambiguation or user declined, return the best match
+        # Return the best match
         best_match = all_candidates[0]
+        source_emoji = "🗄️" if best_match["source"] == "database" else "⚙️"
         self.logger.info(
-            f"🎯 Best match: {best_match['server_name']} (source: {best_match['source']}, score: {best_match['score']:.2f})"
+            f"✅ Using {source_emoji} '{best_match['server_name']}' (source: {best_match['source']}, score: {best_match['score']:.2f}) - fallback match"
         )
 
         return best_match
 
-    def _score_all_server_matches(
-        self, keywords: List[str], servers: List[str], source: str
-    ) -> List[Dict[str, Any]]:
-        """Score all servers and return all matches above threshold"""
-        if not servers or not keywords:
-            return []
+    async def _try_direct_organization_tool_lookup(
+        self, keywords: List[str], message: str
+    ) -> Optional[Dict[str, Any]]:
+        """Try direct database lookup for ORGANIZATION + TOOL patterns (e.g., 'ARC Supabase')"""
 
-        matches = []
+        if len(keywords) < 2:
+            return None
+
+        # Detect organization + tool patterns
+        org_tool_patterns = self._detect_organization_tool_patterns(keywords, message)
+
+        if not org_tool_patterns:
+            return None
+
+        for pattern in org_tool_patterns:
+            org_name = pattern["organization"]
+            tool_name = pattern["tool"]
+
+            self.logger.info(f"🔍 Direct lookup: {org_name} + {tool_name}")
+
+            # Try exact database lookup for this organization + tool combination
+            direct_match = await self._lookup_exact_organization_tool(
+                org_name, tool_name
+            )
+
+            if direct_match:
+                return {
+                    "source": "database",
+                    "server_name": direct_match["server_name"],
+                    "score": 3.0,  # Highest priority score
+                    "keywords_matched": keywords,
+                    "server_data": direct_match,
+                    "match_type": "direct_organization_tool",
+                    "organization": org_name,
+                    "tool": tool_name,
+                }
+
+        return None
+
+    def _detect_organization_tool_patterns(
+        self, keywords: List[str], message: str
+    ) -> List[Dict[str, str]]:
+        """Detect ORGANIZATION + TOOL patterns in keywords and message"""
+
+        common_tools = [
+            "supabase",
+            "postgres",
+            "mysql",
+            "redis",
+            "mongodb",
+            "sqlite",
+            "airtable",
+            "github",
+            "slack",
+            "discord",
+            "notion",
+            "figma",
+            "anthropic",
+            "openai",
+            "claude",
+            "aws",
+            "azure",
+            "gcp",
+        ]
+
         keywords_lower = [k.lower() for k in keywords]
+        patterns = []
 
-        for server in servers:
-            server_lower = server.lower()
-            score = 0.0
+        # Look for adjacent organization + tool pairs
+        for i, keyword in enumerate(keywords_lower):
+            if keyword in common_tools:
+                # Check if previous keyword could be an organization
+                if i > 0:
+                    prev_keyword = keywords_lower[i - 1]
+                    if prev_keyword not in common_tools and len(prev_keyword) >= 2:
+                        patterns.append({"organization": prev_keyword, "tool": keyword})
 
-            # Exact keyword match
-            for keyword in keywords_lower:
-                if keyword == server_lower:
-                    score += 1.0
-                elif keyword in server_lower:
-                    score += 0.8
-                elif server_lower in keyword:
-                    score += 0.6
+                # Check if next keyword could be an organization
+                if i < len(keywords_lower) - 1:
+                    next_keyword = keywords_lower[i + 1]
+                    if next_keyword not in common_tools and len(next_keyword) >= 2:
+                        patterns.append({"organization": next_keyword, "tool": keyword})
 
-            # Compound keyword matching (e.g., "arc_airtable" vs ["arc", "airtable"])
-            if len(keywords_lower) > 1:
-                compound_match = all(k in server_lower for k in keywords_lower)
-                if compound_match:
-                    score += 1.5  # Bonus for compound matches
+        # Also check message for patterns like "ARC Supabase" or "Company's Tool"
+        import re
 
-            # Specificity bonus (longer, more specific server names get slight bonus)
-            if "_" in server_lower and len(keywords_lower) > 1:
-                score += 0.2
+        org_tool_regex = r"\b([A-Z][A-Za-z\s]{1,20})\s+(supabase|postgres|mysql|redis|mongodb|sqlite|airtable|github|slack|discord|notion|figma)\b"
+        matches = re.finditer(org_tool_regex, message, re.IGNORECASE)
 
-            # Only include matches above a minimum threshold
-            if score >= 0.5:  # Minimum threshold for consideration
-                matches.append(
-                    {
-                        "source": source,
-                        "server_name": server,
-                        "score": score,
-                        "keywords_matched": keywords_lower,
-                        "server_data": None,  # Will be filled for database servers
-                    }
+        for match in matches:
+            org = match.group(1).strip().lower()
+            tool = match.group(2).lower()
+            patterns.append({"organization": org, "tool": tool})
+
+        return patterns
+
+    async def _lookup_exact_organization_tool(
+        self, org_name: str, tool_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Perform exact database lookup for organization + tool combination"""
+
+        # Generate possible server name variations
+        possible_names = [
+            f"{org_name}_{tool_name}",
+            f"{org_name}-{tool_name}",
+            f"{org_name}{tool_name}",
+            f"{tool_name}_{org_name}",
+            f"{tool_name}-{org_name}",
+            f"{org_name}_supabase"
+            if tool_name == "supabase"
+            else f"{org_name}_{tool_name}",
+        ]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_names = []
+        for name in possible_names:
+            if name not in seen:
+                seen.add(name)
+                unique_names.append(name)
+
+        self.logger.info(f"🔍 Trying exact lookups for: {unique_names}")
+
+        # Try each possible name variation
+        for server_name in unique_names:
+            discovered_servers = await self._dynamic_mcp_server_discovery([server_name])
+
+            if discovered_servers:
+                # Found exact match!
+                match = discovered_servers[0]
+                self.logger.info(f"✅ Found exact match: '{server_name}' in database")
+                return match
+
+        # Also try broader organization search
+        org_servers = await self._dynamic_mcp_server_discovery([org_name])
+
+        for server in org_servers:
+            server_name_lower = server["server_name"].lower()
+            if tool_name in server_name_lower and org_name in server_name_lower:
+                self.logger.info(
+                    f"✅ Found broad match: '{server['server_name']}' contains both {org_name} and {tool_name}"
                 )
+                return server
 
-        return matches
+        return None
 
     async def _handle_server_disambiguation(
         self, candidates: List[Dict[str, Any]], keywords: List[str], message: str
@@ -5861,3 +5977,50 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
             return {"success": False, "error": str(e)}
 
     # ======= END OF COMPLETE MCP SERVER ADDITION WORKFLOW =======
+
+    def _score_all_server_matches(
+        self, keywords: List[str], servers: List[str], source: str
+    ) -> List[Dict[str, Any]]:
+        """Score all servers and return all matches above threshold (simplified for fallback)"""
+        if not servers or not keywords:
+            return []
+
+        matches = []
+        keywords_lower = [k.lower() for k in keywords]
+
+        for server in servers:
+            server_lower = server.lower()
+            score = 0.0
+
+            # Exact keyword match
+            for keyword in keywords_lower:
+                if keyword == server_lower:
+                    score += 1.0
+                elif keyword in server_lower:
+                    score += 0.8
+                elif server_lower in keyword:
+                    score += 0.6
+
+            # Compound keyword matching (e.g., "weather_api" vs ["weather", "api"])
+            if len(keywords_lower) > 1:
+                compound_match = all(k in server_lower for k in keywords_lower)
+                if compound_match:
+                    score += 1.5  # Bonus for compound matches
+
+            # Specificity bonus (longer, more specific server names get slight bonus)
+            if "_" in server_lower and len(keywords_lower) > 1:
+                score += 0.2
+
+            # Only include matches above minimum threshold
+            if score >= 0.5:
+                matches.append(
+                    {
+                        "source": source,
+                        "server_name": server,
+                        "score": score,
+                        "keywords_matched": keywords_lower,
+                        "server_data": None,  # Will be filled for database servers
+                    }
+                )
+
+        return matches
