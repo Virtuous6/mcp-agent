@@ -80,17 +80,19 @@ class SlackClientManager:
         if not self.slack_client:
             self.logger.warning("No Slack client available, printing message:")
             print(f"Slack Response: {message}")
-            return
+            return None
 
         try:
-            self.slack_client.chat_postMessage(
+            response = self.slack_client.chat_postMessage(
                 channel=channel_id,
                 text=message,
                 parse="mrkdwn",
                 thread_ts=thread_ts,
             )
+            return response
         except Exception as e:
             self.logger.error(f"Error sending Slack response: {e}")
+            return None
 
     def _handle_slack_events(self, client: SocketModeClient, req: SocketModeRequest):
         """Handle incoming Slack events (synchronous handler for Slack SDK)"""

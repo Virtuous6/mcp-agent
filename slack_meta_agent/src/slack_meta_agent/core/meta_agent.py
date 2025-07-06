@@ -393,8 +393,8 @@ class SlackMetaAgent:
                 - server_name: Unique identifier (required)
                 - display_name: Human-readable name (required) 
                 - description: What the server does (required)
-                - transport: "sse", "stdio", or "websocket" (required)
-                - url: For SSE/websocket servers (required if transport is sse/websocket)
+                - transport: "stdio", "sse", "streamable_http", or "websocket" (required)
+                - url: For SSE/websocket/streamable_http servers (required if transport is sse/websocket/streamable_http)
                 - command: For stdio servers (required if transport is stdio)
                 - args: Command arguments (optional, defaults to empty array)
                 
@@ -2821,8 +2821,8 @@ Reply in this thread to continue...
                 self.current_thread_ts,
             )
 
-            # Check if response was successful (send_response doesn't return a dict like chat_postMessage)
-            if response is None:
+            # Check if response was successful
+            if response is None or not response.get("ok", False):
                 self.logger.error(f"Failed to send human input request to Slack")
                 from mcp_agent.human_input.handler import console_input_callback
 
@@ -3070,6 +3070,16 @@ Reply in this thread to continue...
                 agent = agents[0]
                 self.logger.info(f"🎯 Direct execution with {agent.name} agent")
 
+                # Special handling for capability_inspector to search for specific tools
+                if "capability_inspector" in agent.name:
+                    # Extract tool names from the message
+                    tool_name = self._extract_tool_name_from_message(message)
+                    if tool_name:
+                        self.logger.info(f"🔍 Tool search requested for: {tool_name}")
+                        return await self._perform_capability_introspection(tool_name)
+                    else:
+                        return await self._perform_capability_introspection()
+
                 async with agent:
                     llm = await agent.attach_llm(OpenAIAugmentedLLM)
                     result = await llm.generate_str(message)
@@ -3207,17 +3217,41 @@ Reply in this thread to continue...
             # Configure dynamic server
             from mcp_agent.config import MCPServerSettings
 
+            # Fix transport configuration for ghl-dynamic and similar servers
+            transport = primary_config.get("transport", "sse")
+            url = primary_config.get("url")
+            command = primary_config.get("command")
+            args = primary_config.get("args", [])
+
+            # Special handling for servers with SSE URLs but stdio transport
+            if server_name == "ghl-dynamic" and url and url.endswith("/sse"):
+                self.logger.info(f"🔧 Fixing ghl-dynamic transport configuration")
+                transport = "sse"
+                command = None  # SSE doesn't use command
+                args = []  # SSE doesn't use args
+            elif url and url.endswith("/sse") and transport == "stdio":
+                self.logger.info(
+                    f"🔧 Detected SSE URL with stdio transport, switching to SSE"
+                )
+                transport = "sse"
+                command = None
+                args = []
+
             dynamic_server_config = MCPServerSettings(
                 name=primary_config.get("display_name", server_name),
                 description=primary_config.get(
                     "description", f"Dynamically discovered server: {server_name}"
                 ),
-                transport=primary_config.get("transport", "sse"),
-                url=primary_config.get("url"),
-                command=primary_config.get("command"),
-                args=primary_config.get("args", []),
+                transport=transport,
+                url=url,
+                command=command,
+                args=args,
                 terminate_on_close=True,
             )
+
+            self.logger.info(f"🔧 Server config - transport: {transport}, url: {url}")
+            if command:
+                self.logger.info(f"🔧 Server config - command: {command}, args: {args}")
 
             # Add to registry temporarily
             dynamic_server_name = "dynamic_server"
@@ -3230,7 +3264,16 @@ Reply in this thread to continue...
                 dynamic_agent = Agent(
                     name=f"{agent_name}_{int(datetime.now().timestamp())}",
                     instruction=f"""You are a dynamic agent with access to the '{server_name}' MCP server.
-                    Use the available tools to fulfill user requests with actual data.""",
+                    
+                    This server provides GoHighLevel (GHL) functionality with pre-configured API access.
+                    Use the available tools to fulfill user requests with actual data.
+                    
+                    When a user asks about GHL functionality, use the tools from this server to:
+                    - Retrieve contacts, campaigns, opportunities, or other GHL data
+                    - Perform actions like creating/updating records
+                    - Provide real-time information from the GHL system
+                    
+                    Always list available tools first if you're unsure what actions you can perform.""",
                     server_names=[dynamic_server_name],
                     context=self.mcp_app.context,
                     human_input_callback=self.slack_human_input_callback,
@@ -3900,7 +3943,7 @@ Is there anything else you'd like to share or any other feedback you have?"""
                 "server_name": "What should we call this MCP server? (e.g., 'my_api_server')",
                 "display_name": "What's a friendly display name for this server? (e.g., 'My API Server')",
                 "description": "What does this server do? Please provide a brief description.",
-                "transport": "What transport type does this server use? Options: **sse** (Server-Sent Events), **stdio** (Command Line), or **websocket**",
+                "transport": "What transport type does this server use? Options: **stdio** (Command Line), **sse** (Server-Sent Events), **streamable_http** (HTTP Streaming), or **websocket**",
             }
 
             # Gather required fields
@@ -3914,8 +3957,45 @@ Is there anything else you'd like to share or any other feedback you have?"""
             # Validate and gather transport-specific fields
             transport = server_info["transport"].lower()
 
-            if transport in ["sse", "websocket"]:
-                if "url" not in server_info or not server_info["url"]:
+            # Validate transport against database constraints
+            allowed_transports = ["stdio", "sse", "streamable_http", "websocket"]
+            if transport not in allowed_transports:
+                self.logger.warning(f"Invalid transport type: {transport}")
+                transport_response = await self._ask_user_for_info(
+                    f"Invalid transport type '{server_info['transport']}'. Please choose from: **stdio**, **sse**, **streamable_http**, or **websocket**",
+                    user_id,
+                )
+                if not transport_response or transport_response.lower() in [
+                    "cancel",
+                    "quit",
+                    "exit",
+                ]:
+                    return None
+                transport = transport_response.strip().lower()
+
+                # Re-validate the new transport
+                if transport not in allowed_transports:
+                    return None
+
+            # Store normalized transport type
+            server_info["transport"] = transport
+
+            if transport in ["sse", "websocket", "streamable_http"]:
+                # Check if URL is missing or invalid (not a proper URL)
+                current_url = server_info.get("url", "")
+                is_valid_url = current_url and (
+                    current_url.startswith("http://")
+                    or current_url.startswith("https://")
+                )
+
+                if not current_url or not is_valid_url:
+                    # Clear any invalid URL that might have been set
+                    if current_url and not is_valid_url:
+                        self.logger.warning(
+                            f"Invalid URL detected: '{current_url}', prompting for correct URL"
+                        )
+                        server_info.pop("url", None)
+
                     url_response = await self._ask_user_for_info(
                         f"What's the URL for this {transport.upper()} server? (e.g., 'https://api.example.com/mcp')",
                         user_id,
@@ -3955,9 +4035,6 @@ Is there anything else you'd like to share or any other feedback you have?"""
                     server_info["args"] = args_response.strip().split()
                 else:
                     server_info["args"] = []
-
-            else:
-                return None  # Invalid transport type
 
             # Set defaults for optional fields
             if "args" not in server_info:
@@ -5420,7 +5497,9 @@ Is there anything else you'd like to share or any other feedback you have?"""
 
         return results
 
-    async def _perform_capability_introspection(self) -> str:
+    async def _perform_capability_introspection(
+        self, specific_tool_search: str = None
+    ) -> str:
         """Perform comprehensive capability introspection across all agent types"""
         try:
             self.logger.info("🔍 Starting comprehensive capability introspection...")
@@ -5430,7 +5509,29 @@ Is there anything else you'd like to share or any other feedback you have?"""
                 "mcp_servers": {},
                 "total_tools": 0,
                 "system_overview": {},
+                "tool_search_results": [],
             }
+
+            # If specific tool search is requested, search for tools across all servers
+            if specific_tool_search:
+                self.logger.info(
+                    f"🔍 Searching for specific tool: {specific_tool_search}"
+                )
+                tool_keywords = [
+                    specific_tool_search,
+                    specific_tool_search.replace("-", "_"),
+                    specific_tool_search.replace("_", "-"),
+                ]
+
+                try:
+                    found_tools = await self.db_ops.find_tools_across_servers(
+                        tool_keywords
+                    )
+                    capabilities_info["tool_search_results"] = found_tools
+                    self.logger.info(f"✅ Found {len(found_tools)} matching tools")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Tool search failed: {e}")
+                    capabilities_info["tool_search_results"] = []
 
             # Gather information about each specialized agent type
             for agent_type, spec in self.agent_registry.items():
@@ -5598,6 +5699,59 @@ Is there anything else you'd like to share or any other feedback you have?"""
                 if len(unique_tools) > 5:
                     response += f"  • + {len(unique_tools) - 5} more tools\n"
                 response += "\n"
+
+            # Add tool search results if any were found
+            if capabilities_info["tool_search_results"]:
+                response += f"""**🔍 Tool Search Results for "{specific_tool_search}":**
+
+"""
+                for tool_result in capabilities_info["tool_search_results"]:
+                    response += f"**Found: `{tool_result['tool_name']}`**\n"
+                    response += f"• **Server:** {tool_result['server_name']}\n"
+                    response += (
+                        f"• **Description:** {tool_result['tool_description']}\n"
+                    )
+                    response += f"• **Match Type:** {tool_result['match_type']}\n"
+
+                    # Show some parameter info if available
+                    if tool_result.get("tool_schema") and tool_result[
+                        "tool_schema"
+                    ].get("properties"):
+                        params = list(tool_result["tool_schema"]["properties"].keys())[
+                            :3
+                        ]
+                        response += f"• **Parameters:** {', '.join(params)}"
+                        if len(tool_result["tool_schema"]["properties"]) > 3:
+                            response += f" + {len(tool_result['tool_schema']['properties']) - 3} more"
+                        response += "\n"
+
+                    response += "\n"
+
+                response += f"""**💡 How to use this tool:**
+To use the `{specific_tool_search}` tool, you can:
+1. Ask me to perform a task that requires this specific tool
+2. I'll automatically route your request to the appropriate agent
+3. The agent will use the `{tool_result["server_name"]}` server to access the tool
+
+Example: `@meta-agent use the {specific_tool_search} tool to [describe what you want to do]`
+
+"""
+            elif specific_tool_search:
+                response += f"""**🔍 Tool Search Results for "{specific_tool_search}":**
+
+❌ **No matching tools found** in the database.
+
+This could mean:
+1. The tool name might be slightly different (try variations like `{specific_tool_search.replace("-", "_")}` or `{specific_tool_search.replace("_", "-")}`)
+2. The tool might be on a server that isn't currently configured
+3. The tool might need to be added to the database
+
+Try asking me to:
+• List all available tools: `@meta-agent what tools do you have access to?`
+• Search for similar tools: `@meta-agent find tools related to [keyword]`
+• Add a new MCP server: `@meta-agent I want to add a new MCP server`
+
+"""
 
             response += """**💡 Usage Examples:**
 • `@meta-agent what is the weather in Austin?` → **Data Researcher** (brave_search, fetch)
@@ -6086,3 +6240,51 @@ Try asking me to perform specific tasks, and I'll route your request to the appr
                 )
 
         return matches
+
+    def _extract_tool_name_from_message(self, message: str) -> Optional[str]:
+        """Extract tool name from user message when asking about specific tools"""
+        import re
+
+        message_lower = message.lower()
+
+        # Common patterns for tool requests
+        tool_patterns = [
+            r"use the ([a-zA-Z0-9_-]+) tool",
+            r"find the ([a-zA-Z0-9_-]+) tool",
+            r"what.*([a-zA-Z0-9_-]+) tool",
+            r"([a-zA-Z0-9_-]+) tool",
+            r"ghl[_-]?dynamic",  # Specific pattern for ghl-dynamic
+            r"([a-zA-Z0-9]+)[_-]([a-zA-Z0-9]+)",  # General compound tool names
+        ]
+
+        for pattern in tool_patterns:
+            matches = re.findall(pattern, message_lower)
+            if matches:
+                if isinstance(matches[0], tuple):
+                    # For compound patterns like ghl-dynamic
+                    tool_name = "_".join(matches[0])
+                else:
+                    tool_name = matches[0]
+
+                # Clean up the tool name
+                tool_name = tool_name.strip()
+
+                # Skip common words that aren't tool names
+                skip_words = {
+                    "the",
+                    "this",
+                    "that",
+                    "use",
+                    "find",
+                    "what",
+                    "can",
+                    "you",
+                    "have",
+                    "access",
+                    "to",
+                }
+                if tool_name not in skip_words and len(tool_name) > 2:
+                    self.logger.info(f"🎯 Extracted tool name: {tool_name}")
+                    return tool_name
+
+        return None

@@ -39,7 +39,7 @@
     ],
     "agent": "capability_inspector",
     "confidence": 0.9,
-    "usage_count": 0
+    "usage_count": 1
   },
   "financial": {
     "keywords": [
@@ -183,7 +183,13 @@
       "gmail,",
       "some",
       "google",
-      "here"
+      "here",
+      "server",
+      "dynamic",
+      "inspect",
+      "ghl-dynamic",
+      "capabilities\"",
+      "have?"
     ],
     "agent": "data_researcher",
     "confidence": 0.7,
@@ -240,6 +246,21 @@
       "what"
     ],
     "agent": "project_manager",
+    "confidence": 0.7,
+    "usage_count": 0
+  },
+  "capability_inspector": {
+    "keywords": [
+      "tell",
+      "ghl-dynamic",
+      "has?",
+      "<@u0933uc9qeb>",
+      "tools",
+      "what",
+      "tool",
+      "dynamic"
+    ],
+    "agent": "capability_inspector",
     "confidence": 0.7,
     "usage_count": 0
   }

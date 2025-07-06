@@ -361,15 +361,35 @@ class MCPServerDiscovery:
             # Configure the dynamic server slot with the discovered server's settings
             from mcp_agent.config import MCPServerSettings
 
+            # Fix transport configuration for ghl-dynamic and similar servers
+            transport = server_config.get("transport", "sse")
+            url = server_config.get("url")
+            command = server_config.get("command")
+            args = server_config.get("args", [])
+
+            # Special handling for servers with SSE URLs but stdio transport
+            if server_name == "ghl-dynamic" and url and url.endswith("/sse"):
+                self.logger.info(f"🔧 Fixing ghl-dynamic transport configuration")
+                transport = "sse"
+                command = None  # SSE doesn't use command
+                args = []  # SSE doesn't use args
+            elif url and url.endswith("/sse") and transport == "stdio":
+                self.logger.info(
+                    f"🔧 Detected SSE URL with stdio transport, switching to SSE"
+                )
+                transport = "sse"
+                command = None
+                args = []
+
             dynamic_server_config = MCPServerSettings(
                 name=server_config.get("display_name", server_name),
                 description=server_config.get(
                     "description", f"Dynamically discovered server: {server_name}"
                 ),
-                transport=server_config.get("transport", "sse"),
-                url=server_config.get("url"),
-                command=server_config.get("command"),
-                args=server_config.get("args", []),
+                transport=transport,
+                url=url,
+                command=command,
+                args=args,
                 headers=server_config.get("headers"),
                 terminate_on_close=server_config.get("terminate_on_close", True),
             )

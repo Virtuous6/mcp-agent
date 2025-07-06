@@ -210,6 +210,114 @@ class SupabaseOperations:
             self.logger.error(f"❌ MCP server discovery error: {e}")
             return []
 
+    async def find_tools_across_servers(self, tool_keywords: List[str]) -> List[Dict]:
+        """Find tools by name across all available servers"""
+        try:
+            self.logger.info(f"🔍 Searching for tools matching: {tool_keywords}")
+
+            # First get all active servers
+            all_servers = await self.discover_mcp_servers([])  # Get all servers
+
+            found_tools = []
+
+            # For each server, try to discover tools and search for matching ones
+            for server_config in all_servers:
+                server_name = server_config.get("server_name", "unknown")
+                self.logger.info(f"🔍 Checking server '{server_name}' for tools...")
+
+                try:
+                    # Try to discover tools from this server
+                    tools_info = await self._discover_tools_from_server(server_config)
+
+                    # Search for matching tools
+                    for tool in tools_info:
+                        tool_name = tool.get("name", "").lower()
+                        tool_description = tool.get("description", "").lower()
+
+                        # Check if any keyword matches the tool name or description
+                        for keyword in tool_keywords:
+                            keyword_lower = keyword.lower()
+                            if (
+                                keyword_lower in tool_name
+                                or keyword_lower in tool_description
+                                or tool_name in keyword_lower
+                            ):
+                                found_tools.append(
+                                    {
+                                        "tool_name": tool.get("name"),
+                                        "tool_description": tool.get("description"),
+                                        "server_name": server_name,
+                                        "server_config": server_config,
+                                        "tool_schema": tool.get("parameters", {}),
+                                        "match_type": "tool_name"
+                                        if keyword_lower in tool_name
+                                        else "tool_description",
+                                    }
+                                )
+                                self.logger.info(
+                                    f"✅ Found tool '{tool['name']}' on server '{server_name}'"
+                                )
+                                break
+
+                except Exception as e:
+                    self.logger.warning(
+                        f"⚠️ Could not discover tools from server '{server_name}': {e}"
+                    )
+                    continue
+
+            self.logger.info(
+                f"🎯 Found {len(found_tools)} matching tools across all servers"
+            )
+            return found_tools
+
+        except Exception as e:
+            self.logger.error(f"❌ Tool search across servers error: {e}")
+            return []
+
+    async def _discover_tools_from_server(self, server_config: Dict) -> List[Dict]:
+        """Discover tools from a specific server configuration"""
+        try:
+            from mcp_agent.agents.agent import Agent
+            from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+
+            # Create a temporary agent to connect to this server
+            temp_agent = Agent(
+                name=f"tool_discovery_{server_config['server_name']}",
+                instruction="Discover tools from server",
+                server_names=[server_config["server_name"]],
+                context=None,  # Will use default context
+            )
+
+            tools = []
+
+            async with temp_agent:
+                # Try to list tools from this server
+                try:
+                    tools_result = await temp_agent.list_tools(
+                        server_config["server_name"]
+                    )
+
+                    if tools_result and tools_result.tools:
+                        tools = [
+                            {
+                                "name": tool.name,
+                                "description": tool.description
+                                or "No description available",
+                                "parameters": getattr(tool, "inputSchema", {}),
+                            }
+                            for tool in tools_result.tools
+                        ]
+                except Exception as e:
+                    self.logger.warning(
+                        f"Could not list tools from {server_config['server_name']}: {e}"
+                    )
+
+            return tools
+
+        except Exception as e:
+            self.logger.warning(f"Could not discover tools from server: {e}")
+            return []
+
     async def verify_data_insertion(self) -> str:
         """Verify that data was actually inserted into the database"""
         try:
@@ -335,7 +443,9 @@ class SupabaseOperations:
                 "'", "''"
             )
             description = server_info.get("description", "").replace("'", "''")
-            transport = server_info["transport"]
+            transport = server_info[
+                "transport"
+            ].lower()  # Normalize to lowercase for database constraint
             url = (
                 server_info.get("url", "").replace("'", "''")
                 if server_info.get("url")
