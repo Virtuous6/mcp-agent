@@ -21,6 +21,10 @@ structlog>=23.2.0
 asyncio-mqtt>=0.16.0
 aiofiles>=23.2.1
 
+# CrewAI Integration for Multi-Agent Workflows
+crewai>=0.28.0
+crewai-tools>=0.2.6
+
 # Development dependencies
 pytest>=7.0.0
 pytest-asyncio>=0.21.0

@@ -22,6 +22,7 @@ from mcp_agent.human_input.types import HumanInputRequest, HumanInputResponse
 from .conversation import ConversationState, ConversationTurn
 from .agent_spec import AgentSpec
 from ..database.supabase_operations import SupabaseOperations
+from ..database.supabase_pool_manager import SupabasePoolManager
 
 # from ..routing.intent_analyzer import IntentAnalyzer  # Not using the separate class, using original method
 from ..slack.slack_client import SlackClientManager
@@ -44,6 +45,23 @@ except ImportError:
     explore_any_mcp_server = None
     print_exploration_results = None
 
+# Import CrewAI for multi-agent workflows
+try:
+    from crewai import Agent as CrewAgent, Task, Crew, Process
+    from crewai.tools import BaseTool
+    from crewai_tools import SerperDevTool, WebsiteSearchTool
+
+    CREWAI_AVAILABLE = True
+except ImportError:
+    CrewAgent = None
+    Task = None
+    Crew = None
+    Process = None
+    BaseTool = None
+    SerperDevTool = None
+    WebsiteSearchTool = None
+    CREWAI_AVAILABLE = False
+
 
 class SlackMetaAgent:
     """
@@ -65,9 +83,13 @@ class SlackMetaAgent:
         self.slack_manager = SlackClientManager()
         self.mcp_discovery = MCPServerDiscovery(mcp_app, supabase_project_id)
 
+        # High-performance database pool manager
+        self.pool_manager: Optional[SupabasePoolManager] = None
+
         # Core state
         self.conversation_states: Dict[str, ConversationState] = {}
-        self.agent_registry: Dict[str, AgentSpec] = self._initialize_agent_registry()
+        # 🔄 CHANGE: Use dynamic agent registry by default, fallback to static
+        self.agent_registry: Dict[str, AgentSpec] = {}  # Will be populated dynamically
         self.session_id = None
 
         # Agent pool and management
@@ -131,6 +153,19 @@ class SlackMetaAgent:
                     self.logger.info(
                         "✅ Direct Supabase client initialized for reliable operations"
                     )
+
+                    # Initialize high-performance pool manager
+                    self.pool_manager = SupabasePoolManager(
+                        project_id=supabase_project_id,
+                        anon_key=anon_key,
+                        service_role_key=service_role_key,
+                        max_connections=8,  # Optimized for meta-agent workload
+                        default_cache_ttl=300,  # 5 minutes default cache
+                        enable_metrics=True,
+                    )
+                    self.logger.info(
+                        "⚡ High-performance Supabase pool manager initialized"
+                    )
                 else:
                     if not secrets_loaded:
                         self.logger.warning(
@@ -174,8 +209,9 @@ class SlackMetaAgent:
             "learning_persistence_file": "slack_meta_agent/data/pattern_learning.json",
         }
 
-        # Load persistent learning patterns
+        # Load persistent learning patterns (will be optimized after async init)
         self.dynamic_patterns = self._load_learning_patterns()
+        self._patterns_loaded_from_db = False
 
         # Usage tracking
         self.agent_usage_stats = {}
@@ -185,6 +221,112 @@ class SlackMetaAgent:
 
         # Legacy conversation memory for backward compatibility
         self.conversation_memory: Dict[str, List[Dict]] = {}
+
+    async def initialize_optimized_components(self):
+        """Initialize optimized database components after async context is available"""
+        if not self.pool_manager:
+            self.logger.info(
+                "⚠️ Pool manager not available, loading agents from fallback"
+            )
+            # Load fallback static registry if no pool manager
+            self.agent_registry = self._initialize_agent_registry()
+            return
+
+        try:
+            self.logger.info("⚡ Initializing dynamic agent system...")
+
+            # Initialize pool manager
+            await self.pool_manager.initialize()
+
+            # 🎯 PRIORITY: Load agents from database first
+            try:
+                dynamic_registry = await self._initialize_agent_registry_dynamic()
+                if dynamic_registry and len(dynamic_registry) > 0:
+                    self.agent_registry = dynamic_registry
+                    self.logger.info(
+                        f"✅ Loaded {len(dynamic_registry)} agents dynamically from database"
+                    )
+                else:
+                    self.logger.warning(
+                        "⚠️ No dynamic agents found, using static fallback"
+                    )
+                    self.agent_registry = self._initialize_agent_registry()
+            except Exception as e:
+                self.logger.warning(
+                    f"Dynamic agent loading failed: {e}, using static fallback"
+                )
+                self.agent_registry = self._initialize_agent_registry()
+
+            # Load optimized patterns if not already loaded
+            if not self._patterns_loaded_from_db:
+                optimized_patterns = await self._load_learning_patterns_optimized()
+                if optimized_patterns and len(optimized_patterns) > 0:
+                    self.dynamic_patterns = optimized_patterns
+                    self._patterns_loaded_from_db = True
+                    self.logger.info(
+                        f"✅ Loaded {len(optimized_patterns)} patterns from database"
+                    )
+                else:
+                    self.logger.info("📚 Using default patterns")
+
+            self.logger.info("✅ Dynamic agent system initialized successfully")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize dynamic components: {e}")
+            self.logger.info("🔄 Loading static fallback components")
+            self.agent_registry = self._initialize_agent_registry()
+
+    async def get_performance_metrics(self) -> Dict[str, Any]:
+        """Get performance metrics from the pool manager"""
+        if not self.pool_manager:
+            return {"error": "Pool manager not available"}
+
+        return self.pool_manager.get_performance_metrics()
+
+    async def _initialize_agent_registry_dynamic(self) -> Dict[str, AgentSpec]:
+        """Load agent definitions from Supabase dynamically (OPTIMIZED VERSION)"""
+        if not self.pool_manager:
+            # Fallback to original method if pool manager not available
+            return self._initialize_agent_registry()
+
+        try:
+            await self.pool_manager.initialize()
+            self.logger.info("📚 Loading agents from database with optimized pool...")
+
+            # Use optimized agent loading
+            result = await self.pool_manager.get_all_dynamic_agents()
+
+            if result["success"] and result["data"]:
+                registry = {}
+                for agent_data in result["data"]:
+                    # Extract server names from dynamic_servers column
+                    server_names = agent_data.get("dynamic_servers", [])
+                    if server_names and server_names[0]:  # Filter out None values
+                        server_names = [s for s in server_names if s]
+                    else:
+                        server_names = []
+
+                    registry[agent_data["agent_type"]] = AgentSpec(
+                        name=agent_data["name"],
+                        instruction=agent_data["instruction"],
+                        server_names=server_names,
+                        capabilities=agent_data.get("capabilities", []),
+                        metadata=agent_data.get("metadata", {}),
+                    )
+
+                self.logger.info(
+                    f"✅ Loaded {len(registry)} agents from database (cached for 10min)"
+                )
+                return registry
+            else:
+                self.logger.warning(
+                    f"No agents found in database: {result.get('error', 'Unknown error')}"
+                )
+                return self._initialize_agent_registry()  # Fallback
+
+        except Exception as e:
+            self.logger.error(f"Failed to load agents from database: {e}")
+            return self._initialize_agent_registry()  # Fallback
 
     def _initialize_agent_registry(self) -> Dict[str, AgentSpec]:
         """Initialize the registry of available specialized agents - FULL VERSION from main.py"""
@@ -439,6 +581,49 @@ class SlackMetaAgent:
         }
 
     # Add all the missing core methods from main.py
+    async def _load_learning_patterns_optimized(self) -> Dict[str, Dict]:
+        """Load persistent learning patterns from database with optimized caching"""
+        if not self.pool_manager:
+            return self._load_learning_patterns()
+
+        try:
+            self.logger.info("📚 Loading learning patterns with optimized pool...")
+
+            result = await self.pool_manager.get_learning_patterns_optimized()
+
+            if result["success"] and result["data"]:
+                pattern_dict = {}
+                for pattern in result["data"]:
+                    target = (
+                        pattern["agent_name"]
+                        or pattern["workflow_name"]
+                        or pattern["crew_name"]
+                    )
+
+                    pattern_dict[pattern["name"]] = {
+                        "keywords": pattern["keywords"],
+                        "agent": pattern["agent_name"],
+                        "workflow": pattern["workflow_name"],
+                        "crew": pattern["crew_name"],
+                        "target": target,
+                        "confidence": pattern["confidence"],
+                        "usage_count": pattern["usage_count"],
+                        "success_rate": pattern.get("success_rate", 0.0),
+                        "context_filter": pattern.get("context_filter", {}),
+                    }
+
+                self.logger.info(
+                    f"✅ Loaded {len(pattern_dict)} patterns from database (cached for 10min)"
+                )
+                return pattern_dict
+            else:
+                self.logger.warning("No patterns found in database, using defaults")
+                return self._load_learning_patterns()  # Fallback
+
+        except Exception as e:
+            self.logger.error(f"Failed to load patterns from database: {e}")
+            return self._load_learning_patterns()  # Fallback
+
     def _load_learning_patterns(self) -> Dict[str, Dict]:
         """Load persistent learning patterns from file or create defaults"""
         try:
@@ -1677,7 +1862,33 @@ class SlackMetaAgent:
                     "requires_tools": [],
                 }
 
-            # 🎯 THIRD: Check if we need dynamic MCP server discovery for organization-qualified servers (NEW PRIORITY)
+            # 🔄 THIRD: Check for workflow triggers (database-driven workflows)
+            workflow_match = await self._check_workflow_triggers(message, context)
+            if workflow_match:
+                workflow = workflow_match["workflow"]
+                self.logger.info(
+                    f"🔄 PRIORITY: Workflow triggered: {workflow['name']} for: {message[:50]}..."
+                )
+
+                return {
+                    "required_agents": [],  # Workflows handle their own execution
+                    "complexity": "workflow",
+                    "estimated_tasks": len(
+                        workflow.get("definition", {}).get("steps", [1])
+                    ),
+                    "execution_strategy": "workflow",
+                    "priority": "high",
+                    "task_description": f"Execute {workflow['type']} workflow: {workflow['name']}",
+                    "reasoning": f"Workflow trigger detected for {workflow['name']} (confidence: {workflow_match['confidence']:.2f})",
+                    "intent_name": f"workflow_{workflow['name']}",
+                    "confidence": "high"
+                    if workflow_match["confidence"] > 0.85
+                    else "medium",
+                    "workflow": workflow,
+                    "workflow_confidence": workflow_match["confidence"],
+                }
+
+            # 🎯 FOURTH: Check if we need dynamic MCP server discovery for organization-qualified servers (NEW PRIORITY)
             # This needs to happen BEFORE pattern matching to avoid generic supabase/airtable patterns intercepting qualified requests
             message_keywords = self._extract_discovery_keywords_from_message(message)
 
@@ -1721,7 +1932,7 @@ class SlackMetaAgent:
                         "qualified_services": True,
                     }
 
-            # 🚀 FOURTH: Dynamic pattern matching (moved after feedback and org-qualified check)
+            # 🚀 FIFTH: Dynamic pattern matching (moved after feedback, workflows, and org-qualified check)
             pattern_match = self._dynamic_pattern_match(message)
             if pattern_match:
                 agent_type = pattern_match["agent"]
@@ -1748,7 +1959,7 @@ class SlackMetaAgent:
                     "matched_keywords": matched_keywords,
                 }
 
-            # 🔍 FIFTH: Check if we need dynamic MCP server discovery (for non-org-qualified requests)
+            # 🔍 SIXTH: Check if we need dynamic MCP server discovery (for non-org-qualified requests)
             if not has_org_qualifier and not has_explicit_org_pattern:
                 needs_dynamic_discovery = await self._check_if_needs_dynamic_discovery(
                     message, message_keywords
@@ -1779,7 +1990,7 @@ class SlackMetaAgent:
                         "qualified_services": False,
                     }
 
-            # 🤖 SIXTH: Fall back to LLM routing for complex/ambiguous requests
+            # 🤖 SEVENTH: Fall back to LLM routing for complex/ambiguous requests
             self.logger.info(f"🤖 Using LLM routing for: {message[:50]}...")
 
             # Get fresh tool discovery (with caching)
@@ -2927,7 +3138,7 @@ Reply in this thread to continue...
             return None
 
     async def test_mcp_server_addition(self):
-        """Test the MCP server addition functionality"""
+        """Test MCP server addition functionality"""
         self.logger.info("🧪 Testing MCP server addition functionality...")
 
         test_cases = [
@@ -3024,6 +3235,60 @@ Reply in this thread to continue...
         self.logger.info(f"🧪 Test completed: {passed_tests}/{total_tests} passed")
         return report
 
+    async def test_mcp_server_addition(self):
+        """Test MCP server addition workflow"""
+        try:
+            test_message = (
+                "Add a new MCP server called test-server with URL http://localhost:3000"
+            )
+            result = await self.add_mcp_server_workflow(test_message, "test_user")
+            print(f"MCP Server Addition Test Result: {result}")
+            return True
+        except Exception as e:
+            print(f"MCP Server Addition Test Failed: {e}")
+            return False
+
+    async def test_crewai_integration(self):
+        """Test CrewAI workflow integration"""
+        try:
+            if not CREWAI_AVAILABLE:
+                print("❌ CrewAI not available - skipping test")
+                return False
+
+            # Test with a simple dynamic crew workflow
+            test_workflow = {
+                "id": "test_crew_001",
+                "name": "Test CrewAI Workflow",
+                "type": "crewai",
+                "description": "Test workflow for CrewAI integration",
+                "required_agents": ["data_researcher", "communication_specialist"],
+                "is_active": True,
+            }
+
+            test_message = "Create a brief report about artificial intelligence trends"
+            test_context = {"user_id": "test_user", "channel_id": "test_channel"}
+
+            self.logger.info("🧪 Testing CrewAI integration...")
+
+            # Test the CrewAI workflow execution
+            result = await self._execute_crew_workflow(
+                test_workflow, test_message, test_context
+            )
+
+            if result and not result.startswith("❌"):
+                self.logger.info("✅ CrewAI integration test passed")
+                print(f"CrewAI Test Result: {result[:200]}...")
+                return True
+            else:
+                self.logger.error(f"❌ CrewAI integration test failed: {result}")
+                print(f"CrewAI Test Failed: {result}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"CrewAI integration test error: {e}")
+            print(f"CrewAI Test Exception: {e}")
+            return False
+
     # ===== MISSING CORE METHODS FROM ORIGINAL MAIN.PY =====
 
     async def _execute_orchestrated_workflow(
@@ -3031,6 +3296,17 @@ Reply in this thread to continue...
     ) -> str:
         """Execute orchestrated multi-agent workflow"""
         try:
+            # Special handling for workflow execution (NEW)
+            if intent_analysis.get("execution_strategy") == "workflow":
+                self.logger.info("🔄 Executing database-driven workflow")
+                workflow = intent_analysis.get("workflow")
+                if workflow:
+                    return await self._execute_workflow(
+                        workflow, message, intent_analysis
+                    )
+                else:
+                    return "❌ Workflow configuration missing from intent analysis"
+
             # Special handling for MCP server addition workflow
             if (
                 len(agents) == 1
@@ -3111,6 +3387,624 @@ Reply in this thread to continue...
             self.logger.error(f"Orchestration error: {e}")
             return await self._execute_sequential_fallback(message, agents)
 
+    # ===== WORKFLOW EXECUTION ENGINE =====
+
+    async def _check_workflow_triggers(
+        self, message: str, context: Dict
+    ) -> Optional[Dict]:
+        """Check if message triggers any workflows from database"""
+        try:
+            # Try pool manager first, fallback to db_ops
+            workflows = None
+            if self.pool_manager:
+                workflows = await self.pool_manager.get_workflows_by_trigger(
+                    message.lower().split()
+                )
+            else:
+                # Fallback to direct database operations
+                try:
+                    workflows = await self.db_ops.get_workflows_by_trigger(
+                        message.lower().split()
+                    )
+                except Exception as db_error:
+                    self.logger.warning(f"Database workflow lookup failed: {db_error}")
+                    return None
+
+            if not workflows or not workflows.get("success"):
+                return None
+
+            workflow_list = workflows.get("data", [])
+            if not workflow_list:
+                return None
+
+            message_words = set(message.lower().split())
+
+            best_match = None
+            best_confidence = 0.0
+
+            for workflow in workflow_list:
+                if not workflow.get("is_active", True):
+                    continue
+
+                trigger_patterns = workflow.get("trigger_patterns", [])
+                if not trigger_patterns:
+                    continue
+
+                # Calculate confidence based on trigger pattern matching
+                confidence = self._calculate_workflow_confidence(
+                    message, workflow, message_words
+                )
+
+                if (
+                    confidence > best_confidence and confidence >= 0.7
+                ):  # Minimum threshold
+                    best_confidence = confidence
+                    best_match = {
+                        "workflow": workflow,
+                        "confidence": confidence,
+                        "matched_patterns": [
+                            p
+                            for p in trigger_patterns
+                            if any(word in message.lower() for word in p.split())
+                        ],
+                    }
+
+            if best_match:
+                self.logger.info(
+                    f"🔄 Workflow match: {best_match['workflow']['name']} (confidence: {best_confidence:.2f})"
+                )
+                # Update workflow usage statistics
+                await self._update_workflow_usage(
+                    best_match["workflow"]["id"], success=None
+                )  # Pre-execution tracking
+
+            return best_match
+
+        except Exception as e:
+            self.logger.error(f"Workflow trigger checking error: {e}")
+            return None
+
+    def _calculate_workflow_confidence(
+        self, message: str, workflow: Dict, message_words: set
+    ) -> float:
+        """Calculate confidence score for workflow trigger matching"""
+        trigger_patterns = workflow.get("trigger_patterns", [])
+        if not trigger_patterns:
+            return 0.0
+
+        total_score = 0.0
+        pattern_count = 0
+
+        for pattern in trigger_patterns:
+            if not pattern:
+                continue
+
+            pattern_words = set(pattern.lower().split())
+
+            # Exact pattern match gets highest score
+            if pattern.lower() in message.lower():
+                total_score += 1.0
+                pattern_count += 1
+                continue
+
+            # Partial word matching
+            matching_words = message_words.intersection(pattern_words)
+            if matching_words:
+                # Score based on percentage of pattern words matched
+                word_match_score = len(matching_words) / len(pattern_words)
+                total_score += word_match_score * 0.8  # Slightly lower than exact match
+                pattern_count += 1
+
+        if pattern_count == 0:
+            return 0.0
+
+        # Average confidence across all patterns, with bonus for multiple pattern matches
+        base_confidence = total_score / pattern_count
+
+        # Boost confidence if multiple patterns match
+        if pattern_count > 1:
+            base_confidence = min(1.0, base_confidence * 1.1)
+
+        return base_confidence
+
+    async def _execute_workflow(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute workflow based on type"""
+        workflow_type = workflow.get("type", "unknown")
+        workflow_name = workflow.get("name", "unnamed_workflow")
+
+        try:
+            self.logger.info(f"🔄 Executing {workflow_type} workflow: {workflow_name}")
+
+            if workflow_type == "n8n":
+                result = await self._execute_n8n_workflow(
+                    workflow, user_message, context
+                )
+            elif workflow_type == "internal":
+                result = await self._execute_internal_workflow(
+                    workflow, user_message, context
+                )
+            elif workflow_type == "sequential":
+                result = await self._execute_sequential_workflow(
+                    workflow, user_message, context
+                )
+            elif workflow_type == "crewai":
+                # Execute CrewAI multi-agent workflows
+                result = await self._execute_crew_workflow(
+                    workflow, user_message, context
+                )
+            else:
+                result = f"❌ Unknown workflow type: {workflow_type}"
+                await self._update_workflow_usage(workflow.get("id"), success=False)
+                return result
+
+            # Update success metrics
+            await self._update_workflow_usage(workflow.get("id"), success=True)
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Workflow execution error: {e}")
+            await self._update_workflow_usage(workflow.get("id"), success=False)
+            return f"❌ Workflow execution failed: {str(e)}"
+
+    async def _execute_n8n_workflow(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute n8n workflow via webhook"""
+        try:
+            webhook_url = workflow.get("webhook_url")
+            if not webhook_url:
+                return "❌ n8n workflow missing webhook URL"
+
+            import aiohttp
+            from datetime import datetime
+
+            payload = {
+                "user_message": user_message,
+                "user_context": context or {},
+                "timestamp": datetime.utcnow().isoformat(),
+                "workflow_name": workflow.get("name", "unknown"),
+                "metadata": {
+                    "triggered_by": "slack_meta_agent",
+                    "workflow_id": workflow.get("id"),
+                    "execution_time": datetime.utcnow().isoformat(),
+                },
+            }
+
+            self.logger.info(f"🌐 Calling n8n webhook: {webhook_url}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    webhook_url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60),  # 60 second timeout
+                ) as response:
+                    if response.status == 200:
+                        result_data = await response.json()
+                        output = result_data.get(
+                            "output",
+                            result_data.get(
+                                "result", "n8n workflow completed successfully"
+                            ),
+                        )
+
+                        if isinstance(output, dict):
+                            # Format dict output nicely
+                            output = "\n".join(
+                                [f"**{k}:** {v}" for k, v in output.items()]
+                            )
+
+                        return f"✅ **n8n Workflow Complete: {workflow.get('name', 'Unknown')}**\n\n{output}"
+
+                    elif response.status == 202:
+                        return f"🔄 **n8n Workflow Started: {workflow.get('name', 'Unknown')}**\n\nWorkflow is running asynchronously. You'll be notified when it completes."
+
+                    else:
+                        error_text = await response.text()
+                        return f"❌ **n8n Workflow Failed: {workflow.get('name', 'Unknown')}**\n\nHTTP {response.status}: {error_text}"
+
+        except aiohttp.ClientTimeout:
+            return f"⏱️ **n8n Workflow Timeout: {workflow.get('name', 'Unknown')}**\n\nThe workflow is taking longer than expected. It may still be running in the background."
+        except Exception as e:
+            return f"❌ **n8n Workflow Error: {workflow.get('name', 'Unknown')}**\n\n{str(e)}"
+
+    async def _execute_internal_workflow(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute internal workflow with sequential agent steps"""
+        try:
+            definition = workflow.get("definition", {})
+            steps = definition.get("steps", [])
+
+            if not steps:
+                return f"❌ Internal workflow '{workflow.get('name', 'Unknown')}' has no steps defined"
+
+            results = []
+            current_context = context.copy() if context else {}
+            current_context["original_message"] = user_message
+
+            self.logger.info(f"🔄 Executing {len(steps)} workflow steps")
+
+            for i, step in enumerate(steps, 1):
+                step_type = step.get("type", "unknown")
+                agent_name = step.get("agent", "data_researcher")
+                params = step.get("params", {})
+
+                self.logger.info(
+                    f"Step {i}/{len(steps)}: {step_type} with {agent_name}"
+                )
+
+                try:
+                    # Get agent for this step
+                    if agent_name in self.agent_registry:
+                        agent_spec = self.agent_registry[agent_name]
+
+                        # Create agent for this step
+                        from mcp_agent.agents import Agent
+
+                        step_agent = Agent(
+                            name=f"workflow_step_{i}_{agent_name}",
+                            instruction=agent_spec.instruction,
+                            server_names=agent_spec.server_names,
+                            context=self.mcp_app.context if self.mcp_app else None,
+                        )
+
+                        async with step_agent:
+                            llm = await step_agent.attach_llm(OpenAIAugmentedLLM)
+
+                            # Create step-specific prompt
+                            step_prompt = f"""
+                            Workflow Step {i}: {step_type}
+                            
+                            Original User Request: {user_message}
+                            Step Parameters: {params}
+                            Previous Results: {results[-1] if results else "None"}
+                            
+                            Execute this workflow step and provide the specific output needed for the next step.
+                            """
+
+                            step_result = await llm.generate_str(step_prompt)
+                            results.append(
+                                {
+                                    "step": i,
+                                    "type": step_type,
+                                    "agent": agent_name,
+                                    "result": step_result,
+                                }
+                            )
+
+                    else:
+                        results.append(
+                            {
+                                "step": i,
+                                "type": step_type,
+                                "agent": agent_name,
+                                "result": f"❌ Agent '{agent_name}' not found",
+                            }
+                        )
+
+                except Exception as step_error:
+                    self.logger.error(f"Workflow step {i} error: {step_error}")
+                    results.append(
+                        {
+                            "step": i,
+                            "type": step_type,
+                            "agent": agent_name,
+                            "result": f"❌ Step failed: {str(step_error)}",
+                        }
+                    )
+
+            # Format final result
+            workflow_result = f"✅ **Internal Workflow Complete: {workflow.get('name', 'Unknown')}**\n\n"
+
+            for result in results:
+                workflow_result += f"**Step {result['step']} ({result['type']}):** {result['result']}\n\n"
+
+            return workflow_result
+
+        except Exception as e:
+            return f"❌ **Internal Workflow Error: {workflow.get('name', 'Unknown')}**\n\n{str(e)}"
+
+    async def _execute_sequential_workflow(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute sequential workflow (simplified internal workflow)"""
+        # Sequential workflows are simpler versions of internal workflows
+        return await self._execute_internal_workflow(workflow, user_message, context)
+
+    async def _execute_crew_workflow(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute CrewAI multi-agent workflow"""
+        if not CREWAI_AVAILABLE:
+            return f"❌ **CrewAI Not Available**: CrewAI is required for this workflow but not installed. Please install: pip install crewai crewai-tools"
+
+        try:
+            workflow_name = workflow.get("name", "Unknown CrewAI Workflow")
+            self.logger.info(f"🚀 Executing CrewAI Workflow: {workflow_name}")
+
+            # Check if this is a crew_configs workflow or legacy workflows table
+            crew_config = await self._get_crew_config(workflow)
+            if crew_config:
+                return await self._execute_configured_crew(
+                    crew_config, user_message, context
+                )
+            else:
+                return await self._execute_dynamic_crew(workflow, user_message, context)
+
+        except Exception as e:
+            self.logger.error(f"CrewAI workflow execution failed: {e}")
+            return f"❌ **CrewAI Workflow Error: {workflow.get('name', 'Unknown')}**\n\n{str(e)}"
+
+    async def _get_crew_config(self, workflow: Dict) -> Optional[Dict]:
+        """Get crew configuration from crew_configs table if available"""
+        try:
+            if not self.pool_manager:
+                return None
+
+            # First check if workflow has a crew_config_id
+            crew_config_id = workflow.get("crew_config_id")
+            if crew_config_id:
+                result = await self.pool_manager.get_crew_config_by_id(crew_config_id)
+                if result.get("success") and result.get("data"):
+                    return result["data"][0]
+
+            # Otherwise try to find by workflow name
+            workflow_name = workflow.get("name")
+            if workflow_name:
+                result = await self.pool_manager.get_crew_configs_by_name(workflow_name)
+                if result.get("success") and result.get("data"):
+                    return result["data"][0]
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"Could not get crew config: {e}")
+            return None
+
+    async def _execute_configured_crew(
+        self, crew_config: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Execute a crew from the crew_configs table"""
+        try:
+            # Parse the stored crew configuration
+            crew_data = crew_config.get("crew_data", {})
+            agents_data = crew_data.get("agents", [])
+            tasks_data = crew_data.get("tasks", [])
+
+            if not agents_data or not tasks_data:
+                return f"❌ **Invalid Crew Configuration**: Missing agents or tasks in crew_configs"
+
+            # Create CrewAI agents
+            crew_agents = []
+            for agent_data in agents_data:
+                crew_agent = await self._create_crew_agent(agent_data, context)
+                if crew_agent:
+                    crew_agents.append(crew_agent)
+
+            if not crew_agents:
+                return f"❌ **No Valid Agents**: Could not create any CrewAI agents from configuration"
+
+            # Create CrewAI tasks
+            crew_tasks = []
+            for task_data in tasks_data:
+                task = await self._create_crew_task(
+                    task_data, crew_agents, user_message
+                )
+                if task:
+                    crew_tasks.append(task)
+
+            if not crew_tasks:
+                return f"❌ **No Valid Tasks**: Could not create any CrewAI tasks from configuration"
+
+            # Create and execute the crew
+            crew = Crew(
+                agents=crew_agents,
+                tasks=crew_tasks,
+                process=Process.sequential,  # Default to sequential
+                verbose=True,
+            )
+
+            # Execute the crew
+            result = crew.kickoff()
+
+            # Format the result
+            return f"✅ **CrewAI Workflow Complete: {crew_config.get('name', 'Unknown')}**\n\n{result}"
+
+        except Exception as e:
+            self.logger.error(f"Configured crew execution failed: {e}")
+            return f"❌ **Configured Crew Error**: {str(e)}"
+
+    async def _execute_dynamic_crew(
+        self, workflow: Dict, user_message: str, context: Dict
+    ) -> str:
+        """Create and execute a dynamic crew based on workflow configuration"""
+        try:
+            # Create a basic crew from workflow information
+            agents_needed = workflow.get(
+                "required_agents", ["data_researcher", "communication_specialist"]
+            )
+
+            # Create CrewAI agents for each required agent type
+            crew_agents = []
+            for agent_type in agents_needed:
+                agent_spec = self.agent_registry.get(agent_type)
+                if agent_spec:
+                    crew_agent = await self._create_crew_agent_from_spec(
+                        agent_spec, context
+                    )
+                    if crew_agent:
+                        crew_agents.append(crew_agent)
+
+            if not crew_agents:
+                return f"❌ **No Valid Agents**: Could not create CrewAI agents for types: {agents_needed}"
+
+            # Create a basic task for the crew
+            main_task = Task(
+                description=f"""
+                Collaborate to fulfill this user request: {user_message}
+                
+                Workflow context: {workflow.get("description", "No description available")}
+                
+                Each agent should contribute their specialized expertise to provide a comprehensive response.
+                """,
+                agent=crew_agents[0],  # Assign to first agent as primary
+                expected_output="A comprehensive response that fulfills the user's request using the combined expertise of all agents.",
+            )
+
+            # Create and execute the crew
+            crew = Crew(
+                agents=crew_agents,
+                tasks=[main_task],
+                process=Process.sequential,
+                verbose=True,
+            )
+
+            # Execute the crew
+            result = crew.kickoff()
+
+            return f"✅ **Dynamic CrewAI Workflow Complete: {workflow.get('name', 'Unknown')}**\n\n{result}"
+
+        except Exception as e:
+            self.logger.error(f"Dynamic crew execution failed: {e}")
+            return f"❌ **Dynamic Crew Error**: {str(e)}"
+
+    async def _create_crew_agent(
+        self, agent_data: Dict, context: Dict
+    ) -> Optional[CrewAgent]:
+        """Create a CrewAI agent from configuration data"""
+        try:
+            if not CREWAI_AVAILABLE:
+                return None
+
+            # Extract agent configuration
+            role = agent_data.get("role", "Assistant")
+            goal = agent_data.get("goal", "Help the user achieve their objectives")
+            backstory = agent_data.get("backstory", "I am a helpful AI assistant")
+            tools = agent_data.get("tools", [])
+
+            # Create tools list (can be expanded with MCP tools)
+            agent_tools = []
+            for tool_name in tools:
+                tool = await self._create_crew_tool(tool_name, context)
+                if tool:
+                    agent_tools.append(tool)
+
+            # Create the CrewAI agent
+            crew_agent = CrewAgent(
+                role=role,
+                goal=goal,
+                backstory=backstory,
+                tools=agent_tools,
+                verbose=True,
+                allow_delegation=False,
+            )
+
+            return crew_agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create crew agent: {e}")
+            return None
+
+    async def _create_crew_agent_from_spec(
+        self, agent_spec: AgentSpec, context: Dict
+    ) -> Optional[CrewAgent]:
+        """Create a CrewAI agent from an AgentSpec"""
+        try:
+            if not CREWAI_AVAILABLE:
+                return None
+
+            # Convert AgentSpec to CrewAI agent
+            role = agent_spec.name.replace("_", " ").title()
+            goal = f"Utilize {agent_spec.name} capabilities to help users with {', '.join(agent_spec.capabilities)}"
+            backstory = agent_spec.instruction
+
+            # Create basic tools (can be enhanced with MCP integration)
+            tools = []
+
+            # Create the CrewAI agent
+            crew_agent = CrewAgent(
+                role=role,
+                goal=goal,
+                backstory=backstory,
+                tools=tools,
+                verbose=True,
+                allow_delegation=False,
+            )
+
+            return crew_agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create crew agent from spec: {e}")
+            return None
+
+    async def _create_crew_task(
+        self, task_data: Dict, agents: List[CrewAgent], user_message: str
+    ) -> Optional[Task]:
+        """Create a CrewAI task from configuration data"""
+        try:
+            if not CREWAI_AVAILABLE or not agents:
+                return None
+
+            description = task_data.get("description", "").format(
+                user_message=user_message
+            )
+            expected_output = task_data.get(
+                "expected_output", "Complete the assigned task successfully"
+            )
+            agent_index = task_data.get("agent_index", 0)
+
+            # Ensure agent index is valid
+            if agent_index >= len(agents):
+                agent_index = 0
+
+            task = Task(
+                description=description,
+                agent=agents[agent_index],
+                expected_output=expected_output,
+            )
+
+            return task
+
+        except Exception as e:
+            self.logger.error(f"Failed to create crew task: {e}")
+            return None
+
+    async def _create_crew_tool(
+        self, tool_name: str, context: Dict
+    ) -> Optional[BaseTool]:
+        """Create a CrewAI tool by name"""
+        try:
+            if not CREWAI_AVAILABLE:
+                return None
+
+            # Basic tool mapping (can be expanded)
+            if tool_name == "web_search" and SerperDevTool:
+                return SerperDevTool()
+            elif tool_name == "website_search" and WebsiteSearchTool:
+                return WebsiteSearchTool()
+
+            # Could add MCP tool integration here
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Failed to create crew tool {tool_name}: {e}")
+            return None
+
+    async def _update_workflow_usage(
+        self, workflow_id: str, success: Optional[bool] = None
+    ):
+        """Update workflow usage statistics"""
+        try:
+            if not self.pool_manager or not workflow_id:
+                return
+
+            await self.pool_manager.update_workflow_usage(workflow_id, success)
+
+        except Exception as e:
+            self.logger.error(f"Failed to update workflow usage: {e}")
+
     async def _execute_sequential_fallback(
         self, message: str, agents: List[Agent]
     ) -> str:
@@ -3129,6 +4023,33 @@ Reply in this thread to continue...
                 results.append(f"{agent.name}: Error - {str(e)}")
 
         return "\n\n".join(results)
+
+    async def _dynamic_mcp_server_discovery_optimized(
+        self, query_keywords: List[str]
+    ) -> List[Dict]:
+        """Dynamically discover MCP servers from database with optimized caching"""
+        if not self.pool_manager:
+            return await self._dynamic_mcp_server_discovery(query_keywords)
+
+        try:
+            self.logger.info(
+                f"🔍 Optimized MCP discovery for keywords: {query_keywords}"
+            )
+
+            result = await self.pool_manager.find_servers_by_keywords(query_keywords)
+
+            if result["success"] and result["data"]:
+                return result["data"]
+            else:
+                self.logger.warning(
+                    f"No servers found: {result.get('error', 'Unknown error')}"
+                )
+                return []
+
+        except Exception as e:
+            self.logger.warning(f"Optimized MCP discovery failed: {e}")
+            # Fallback to original method
+            return await self._dynamic_mcp_server_discovery(query_keywords)
 
     async def _dynamic_mcp_server_discovery(
         self, query_keywords: List[str]
