@@ -263,20 +263,39 @@ class SupabaseOperations:
     async def _discover_servers_via_mcp(self, keywords: List[str]) -> List[Dict]:
         """Discover servers using MCP agent method (fallback)"""
         try:
-            # Build search query
-            keyword_conditions = []
-            for keyword in keywords:
-                keyword_conditions.extend(
-                    [
-                        f"LOWER(s.server_name) LIKE LOWER('%{keyword}%')",
-                        f"LOWER(s.display_name) LIKE LOWER('%{keyword}%')",
-                        f"LOWER(s.description) LIKE LOWER('%{keyword}%')",
-                    ]
-                )
-
-            where_clause = (
-                " OR ".join(keyword_conditions) if keyword_conditions else "1=1"
+            # Check if this is a "show all available" request
+            is_show_all_request = any(
+                keyword in ["available", "all", "list", "show"] for keyword in keywords
+            ) and not any(
+                # Don't treat as "show all" if there are specific technical keywords
+                keyword in ["arc", "ghl", "dynamic", "specific_server_name"]
+                for keyword in keywords
             )
+
+            # For "list available servers" type queries, ignore filtering keywords like "supabase"
+            # and show all servers instead of filtering
+            if is_show_all_request and any(
+                k in ["available", "list", "show"] for k in keywords
+            ):
+                self.logger.info(
+                    "🔍 Detected 'show all available servers' request - returning all servers"
+                )
+                where_clause = "1=1"  # Return all servers
+            else:
+                # Build search query with keyword filtering
+                keyword_conditions = []
+                for keyword in keywords:
+                    keyword_conditions.extend(
+                        [
+                            f"LOWER(s.server_name) LIKE LOWER('%{keyword}%')",
+                            f"LOWER(s.display_name) LIKE LOWER('%{keyword}%')",
+                            f"LOWER(s.description) LIKE LOWER('%{keyword}%')",
+                        ]
+                    )
+
+                where_clause = (
+                    " OR ".join(keyword_conditions) if keyword_conditions else "1=1"
+                )
 
             sql_query = f"""
             SELECT 
@@ -616,13 +635,44 @@ class SupabaseOperations:
             async with agent:
                 llm = await agent.attach_llm(OpenAIAugmentedLLM)
 
-                prompt = f"""
-                You must call the execute_sql tool directly with these exact parameters:
-                - project_id: "{self.supabase_project_id}"
-                - query: "{sql}"
-                
-                Call the execute_sql tool now with these parameters. Do not explain, just call the tool.
-                """
+                # Check if this is a server discovery query
+                is_server_query = (
+                    "mcp_servers" in sql.lower() and "select" in sql.lower()
+                )
+
+                if is_server_query:
+                    prompt = f"""
+                    You must call the execute_sql tool with these parameters:
+                    - project_id: "{self.supabase_project_id}"
+                    - query: "{sql}"
+                    
+                    CRITICAL: After calling the tool, format the results as a structured JSON array. Each server must include ALL fields, especially the URL field. 
+                    
+                    Use this exact format:
+                    [
+                        {{
+                            "server_name": "exact_name",
+                            "display_name": "display name or null",
+                            "description": "description or null", 
+                            "transport": "sse/stdio/etc",
+                            "url": "full_https_url_or_null",
+                            "command": "command or null",
+                            "args": []
+                        }}
+                    ]
+                    
+                    Do NOT use markdown formatting. Do NOT add extra text. Return only the JSON array with complete server data.
+                    
+                    Call the execute_sql tool now.
+                    """
+                else:
+                    prompt = f"""
+                    You must call the execute_sql tool directly with these exact parameters:
+                    - project_id: "{self.supabase_project_id}"
+                    - query: "{sql}"
+                    
+                    Call the execute_sql tool now with these parameters. Do not explain, just call the tool.
+                    """
 
                 result = await llm.generate_str(prompt)
                 self.logger.info(f"✅ SQL executed via MCP agent: {result[:100]}...")
@@ -635,25 +685,279 @@ class SupabaseOperations:
     def _parse_mcp_servers_result(self, result: str) -> List[Dict]:
         """Parse MCP server discovery results"""
         try:
-            # Parse JSON or text result into server configurations
             import re
 
             servers = []
 
-            # Try to parse as JSON first
-            try:
-                if result.strip().startswith("["):
-                    servers = json.loads(result)
-            except json.JSONDecodeError:
-                # Parse from text format
-                self.logger.info("🔍 Parsing text-based server data")
+            self.logger.info(f"🔍 Parsing MCP server result: {result[:200]}...")
 
-            self.logger.info(f"🎯 Parsed {len(servers)} servers from result")
-            return servers
+            # Method 1: Extract JSON arrays from the response
+            json_array_pattern = r'\[\s*\{[^}]*"server_name"[^}]*\}[^\]]*\]'
+            json_matches = re.findall(json_array_pattern, result, re.DOTALL)
+
+            for json_str in json_matches:
+                try:
+                    parsed_servers = json.loads(json_str)
+                    if isinstance(parsed_servers, list):
+                        servers.extend(parsed_servers)
+                        self.logger.info(
+                            f"✅ Parsed {len(parsed_servers)} servers from JSON array"
+                        )
+                except json.JSONDecodeError as e:
+                    self.logger.warning(f"Failed to parse JSON array: {e}")
+                    # Try to extract individual fields from the malformed JSON
+                    self._extract_from_malformed_json(json_str, servers)
+
+            # Method 2: Extract individual JSON objects
+            if not servers:
+                json_object_pattern = r'\{[^}]*"server_name"[^}]*\}'
+                json_objects = re.findall(json_object_pattern, result, re.DOTALL)
+
+                for json_str in json_objects:
+                    try:
+                        server_obj = json.loads(json_str)
+                        if isinstance(server_obj, dict) and "server_name" in server_obj:
+                            servers.append(server_obj)
+                            self.logger.info(
+                                f"✅ Parsed server: {server_obj.get('server_name')}"
+                            )
+                    except json.JSONDecodeError:
+                        continue
+
+            # Method 3: Parse markdown-style formatted text
+            if not servers:
+                self.logger.info("🔍 Trying to parse markdown-style server data...")
+
+                # Look for server entries in markdown format
+                server_pattern = r"-\s*\*\*Server Name:\*\*\s*([^\n]+)"
+                server_names = re.findall(server_pattern, result, re.IGNORECASE)
+
+                for server_name in server_names:
+                    server_name = server_name.strip()
+                    if server_name:
+                        # Extract other fields for this server
+                        server_block = {"server_name": server_name}
+
+                        # Try to find display name
+                        display_pattern = rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?Display Name:\*\*\s*([^\n]+))"
+                        display_match = re.search(
+                            display_pattern, result, re.DOTALL | re.IGNORECASE
+                        )
+                        if display_match:
+                            server_block["display_name"] = display_match.group(
+                                1
+                            ).strip()
+
+                        # Try to find description
+                        desc_pattern = rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?Description:\*\*\s*([^\n]+))"
+                        desc_match = re.search(
+                            desc_pattern, result, re.DOTALL | re.IGNORECASE
+                        )
+                        if desc_match:
+                            server_block["description"] = desc_match.group(1).strip()
+
+                        # Try to find transport
+                        transport_pattern = rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?Transport:\*\*\s*([^\n]+))"
+                        transport_match = re.search(
+                            transport_pattern, result, re.DOTALL | re.IGNORECASE
+                        )
+                        if transport_match:
+                            server_block["transport"] = transport_match.group(1).strip()
+
+                        # Try to find URL (multiple patterns)
+                        url_patterns = [
+                            # Pattern 1: **URL:** https://example.com
+                            rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?URL:\*\*\s*([^\n]+))",
+                            # Pattern 2: Markdown links [text](URL)
+                            rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?\[([^\]]+)\]\(([^)]+)\))",
+                            # Pattern 3: URL within parentheses or brackets
+                            rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?[\[\(](https?://[^\s\]\)]+)[\]\)])",
+                            # Pattern 4: Standalone URLs in the server block
+                            rf"(?:Server Name:\*\*\s*{re.escape(server_name)}.*?(https?://[^\s]+))",
+                        ]
+
+                        url_found = False
+                        for pattern in url_patterns:
+                            url_match = re.search(
+                                pattern, result, re.DOTALL | re.IGNORECASE
+                            )
+                            if url_match:
+                                if (
+                                    len(url_match.groups()) == 2
+                                ):  # Markdown link pattern
+                                    url = url_match.group(
+                                        2
+                                    ).strip()  # URL is the second group
+                                else:
+                                    url = url_match.group(
+                                        1
+                                    ).strip()  # URL is the first group
+
+                                    # Clean up the URL - handle malformed markdown
+                                url = url.strip("[]()").strip()
+
+                                # Remove malformed markdown patterns like "](https://..."
+                                if "](https://" in url:
+                                    url = url.split("](https://")[
+                                        0
+                                    ]  # Take the first part before malformed markdown
+                                elif "](http://" in url:
+                                    url = url.split("](http://")[0]
+
+                                # Remove any trailing "](" or similar markdown artifacts
+                                url = url.rstrip("](").strip()
+
+                                if (
+                                    url
+                                    and url.lower() not in ["null", "none", ""]
+                                    and url.startswith(("http://", "https://"))
+                                ):
+                                    server_block["url"] = url
+                                    url_found = True
+                                    break
+
+                        # Additional: Try to find URLs anywhere in the server's text block
+                        if not url_found:
+                            # Look for any https URLs in the server's section
+                            server_section_start = result.find(
+                                f"Server Name:** {server_name}"
+                            )
+                            if server_section_start >= 0:
+                                # Find the next server or end of text
+                                next_server = result.find(
+                                    "Server Name:**", server_section_start + 1
+                                )
+                                server_section = result[
+                                    server_section_start : next_server
+                                    if next_server > 0
+                                    else len(result)
+                                ]
+
+                                # Extract any HTTPS URLs from this section (multiple patterns)
+                                url_patterns_in_section = [
+                                    r"(https://[^\s\]\)]+)",  # Standard URLs
+                                    r"(https://[^\s]+)\]\(",  # Malformed markdown ending
+                                    r"\]\((https://[^\s\)]+)\)",  # Malformed markdown beginning
+                                ]
+
+                                for pattern in url_patterns_in_section:
+                                    url_in_section = re.search(pattern, server_section)
+                                    if url_in_section:
+                                        url = (
+                                            url_in_section.group(1)
+                                            .strip("[]()")
+                                            .strip()
+                                        )
+
+                                        # Clean up malformed markdown in section URLs too
+                                        if "](https://" in url:
+                                            url = url.split("](https://")[0]
+                                        elif "](http://" in url:
+                                            url = url.split("](http://")[0]
+                                        url = url.rstrip("](").strip()
+
+                                        if url.startswith(("http://", "https://")):
+                                            server_block["url"] = url
+                                            break
+
+                        # Set defaults
+                        server_block.setdefault(
+                            "description", f"Specialized MCP server: {server_name}"
+                        )
+                        server_block.setdefault("transport", "sse")
+                        server_block.setdefault("args", [])
+
+                        servers.append(server_block)
+                        self.logger.info(
+                            f"✅ Parsed server from markdown: {server_name}"
+                        )
+
+            # Method 4: Simple name extraction as last resort
+            if not servers:
+                # Look for any mention of server names that look like MCP servers
+                name_patterns = [
+                    r'(?:server_name|name)["\':]?\s*["\'`]?([a-zA-Z0-9_-]+(?:_supabase|_mcp|_server|_api))["\',`]?',
+                    r"([a-zA-Z0-9_-]*(?:arc|tribe|ghl|supabase)[a-zA-Z0-9_-]*)",
+                ]
+
+                for pattern in name_patterns:
+                    matches = re.findall(pattern, result, re.IGNORECASE)
+                    for match in matches:
+                        if match and len(match) > 3:  # Avoid short meaningless matches
+                            server_block = {
+                                "server_name": match,
+                                "description": f"Discovered MCP server: {match}",
+                                "transport": "sse",
+                                "args": [],
+                            }
+                            servers.append(server_block)
+                            self.logger.info(f"✅ Extracted server name: {match}")
+
+            # Remove duplicates based on server_name
+            unique_servers = []
+            seen_names = set()
+            for server in servers:
+                name = server.get("server_name", "")
+                if name and name not in seen_names:
+                    seen_names.add(name)
+                    unique_servers.append(server)
+
+            self.logger.info(
+                f"🎯 Parsed {len(unique_servers)} unique servers from result"
+            )
+            for server in unique_servers:
+                self.logger.info(
+                    f"   - {server['server_name']}: {server.get('transport', 'unknown')} @ {server.get('url', 'no-url')}"
+                )
+
+            return unique_servers
 
         except Exception as e:
             self.logger.warning(f"❌ Server result parsing error: {e}")
+            import traceback
+
+            self.logger.warning(f"Full parsing error: {traceback.format_exc()}")
             return []
+
+    def _extract_from_malformed_json(self, json_str: str, servers: List[Dict]):
+        """Extract server data from malformed JSON using regex patterns"""
+        try:
+            import re  # Fix: Add missing import
+
+            # Extract server_name, url, and other fields using regex
+            server_name_pattern = r'"server_name":\s*"([^"]+)"'
+            display_name_pattern = r'"display_name":\s*"([^"]+)"'
+            description_pattern = r'"description":\s*"([^"]+)"'
+            url_pattern = r'"url":\s*"([^"]+)"'
+            transport_pattern = r'"transport":\s*"([^"]+)"'
+
+            server_names = re.findall(server_name_pattern, json_str)
+            display_names = re.findall(display_name_pattern, json_str)
+            descriptions = re.findall(description_pattern, json_str)
+            urls = re.findall(url_pattern, json_str)
+            transports = re.findall(transport_pattern, json_str)
+
+            # Create server objects from extracted data
+            for i, server_name in enumerate(server_names):
+                server_obj = {
+                    "server_name": server_name,
+                    "display_name": display_names[i]
+                    if i < len(display_names)
+                    else server_name,
+                    "description": descriptions[i]
+                    if i < len(descriptions)
+                    else f"MCP server: {server_name}",
+                    "transport": transports[i] if i < len(transports) else "sse",
+                    "url": urls[i] if i < len(urls) else None,
+                    "args": [],
+                }
+                servers.append(server_obj)
+                self.logger.info(
+                    f"✅ Extracted server from malformed JSON: {server_name}"
+                )
+
+        except Exception as e:
+            self.logger.warning(f"Failed to extract from malformed JSON: {e}")
 
     # ===== NEW DYNAMIC SYSTEM METHODS =====
 

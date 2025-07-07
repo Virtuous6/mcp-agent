@@ -103,10 +103,8 @@ class ModularSlackMetaAgent:
                             mcp_servers = secrets["mcp"]["servers"]
 
                             # Set up Supabase MCP server environment variables
-                            if "TRIBEsupabase" in mcp_servers:
-                                supabase_env = mcp_servers["TRIBEsupabase"].get(
-                                    "env", {}
-                                )
+                            if "supabase" in mcp_servers:
+                                supabase_env = mcp_servers["supabase"].get("env", {})
                                 if "SUPABASE_ACCESS_TOKEN" in supabase_env:
                                     supabase_access_token = supabase_env[
                                         "SUPABASE_ACCESS_TOKEN"
@@ -294,6 +292,7 @@ class ModularSlackMetaAgent:
             pool_manager=self.pool_manager_agent,
             workflow_manager=self.workflow_manager,
             mcp_app=self.mcp_app,
+            db_ops=self.db_ops,
         )
         await self.orchestrator.initialize()
 

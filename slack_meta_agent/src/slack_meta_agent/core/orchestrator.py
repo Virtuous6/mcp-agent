@@ -984,10 +984,60 @@ Write a natural, conversational response that fully addresses the user's request
             keywords = intent.payload.get("discovery_keywords", [])
             self.logger.info(f"🔍 Starting dynamic discovery for keywords: {keywords}")
 
-            # Find best match from database
+            # Find servers from database
             discovered_servers = await self._find_database_servers(keywords)
 
-            if not discovered_servers:
+            # Check if user specifically wants only database servers or all servers
+            query_lower = incoming.text.lower()
+            database_only_keywords = [
+                "supabase servers",
+                "database servers",
+                "servers in supabase",
+                "available supabase",
+                "supabase database",
+                "servers in the database",
+                "have in the database",
+                "stored in database",
+                "database only",
+                "in the database",
+            ]
+            wants_database_only = any(
+                keyword in query_lower for keyword in database_only_keywords
+            )
+
+            if wants_database_only:
+                # User specifically wants servers from Supabase database only
+                all_servers = discovered_servers
+                self.logger.info(
+                    f"🎯 Database-only request: {len(all_servers)} servers from database"
+                )
+            else:
+                # General discovery - combine database and configured servers
+                configured_servers = await self._get_configured_servers()
+
+                # Combine both sources for complete server list
+                all_servers = []
+                server_names_seen = set()
+
+                # Add database servers first
+                for server in discovered_servers:
+                    server_name = server.get("server_name")
+                    if server_name and server_name not in server_names_seen:
+                        all_servers.append(server)
+                        server_names_seen.add(server_name)
+
+                # Add configured servers (avoid duplicates)
+                for server in configured_servers:
+                    server_name = server.get("server_name")
+                    if server_name and server_name not in server_names_seen:
+                        all_servers.append(server)
+                        server_names_seen.add(server_name)
+
+                self.logger.info(
+                    f"🎯 Combined total: {len(all_servers)} servers (database + configured)"
+                )
+
+            if not all_servers:
                 return ExecutionResult(
                     success=False,
                     response=f"⚠️ No MCP servers found for '{', '.join(keywords)}'",
@@ -1000,9 +1050,67 @@ Write a natural, conversational response that fully addresses the user's request
                     },
                 )
 
-            # Use the first discovered server
+            # Use the combined server list
+            discovered_servers = all_servers
+
+            # Check if user wants a LIST vs. CONNECTION to specific server
+            query_lower = incoming.text.lower()
+            list_keywords = [
+                "list",
+                "show all",
+                "available",
+                "what servers",
+                "all servers",
+                "find all",  # Add this pattern
+                "get all",  # Add this pattern
+            ]
+            wants_list = any(keyword in query_lower for keyword in list_keywords)
+
+            # If user wants a list of servers, return the list instead of connecting
+            if wants_list and len(discovered_servers) > 0:
+                self.logger.info(
+                    f"📋 User wants list of servers, returning {len(discovered_servers)} servers instead of connecting"
+                )
+
+                # Format the server list response
+                server_list = []
+                for server in discovered_servers:
+                    server_info = f"**{server['server_name']}**"
+                    if server.get("display_name"):
+                        server_info += f" ({server['display_name']})"
+                    if server.get("description"):
+                        server_info += f"\n  - {server['description']}"
+                    if server.get("url"):
+                        server_info += f"\n  - URL: {server['url']}"
+                    if server.get("transport"):
+                        server_info += f"\n  - Transport: {server['transport']}"
+                    server_list.append(server_info)
+
+                response = (
+                    f"Found {len(discovered_servers)} MCP server(s):\n\n"
+                    + "\n\n".join(server_list)
+                )
+
+                execution_time = (datetime.now() - start_time).total_seconds()
+                return ExecutionResult(
+                    success=True,
+                    response=response,
+                    execution_time=execution_time,
+                    intent_confidence=intent.confidence,
+                    agent_count=0,
+                    metadata={
+                        "execution_type": "server_list",
+                        "discovery_keywords": keywords,
+                        "servers_found": len(discovered_servers),
+                        "servers": [s["server_name"] for s in discovered_servers],
+                    },
+                )
+
+            # Use the first discovered server for connection-based queries
             server_data = discovered_servers[0]
-            self.logger.info(f"✅ Using database server '{server_data['server_name']}'")
+            self.logger.info(
+                f"✅ Using database server '{server_data['server_name']}' for connection"
+            )
 
             # Create dynamic agent with the database server
             dynamic_agent = await self._create_dynamic_agent_with_server(server_data)
@@ -1026,16 +1134,48 @@ Write a natural, conversational response that fully addresses the user's request
                     # Get optimized LLM for the task
                     llm = await self._get_fast_path_llm(dynamic_agent, intent)
 
-                    enhanced_prompt = f"""
-                    Original request: {incoming.text}
-                    
-                    You have access to the specialized '{server_data["server_name"]}' MCP server:
-                    - Description: {server_data.get("description", "Specialized server")}
-                    - Transport: {server_data.get("transport", "unknown")}
-                    
-                    Use the tools from this server to fulfill the user's request.
-                    Provide specific, actionable results with relevant data.
-                    """
+                    # Check if user wants to see server capabilities vs. use the server
+                    is_capability_query = any(
+                        word in incoming.text.lower()
+                        for word in [
+                            "show me",
+                            "what can",
+                            "capabilities",
+                            "tools available",
+                            "what does",
+                            "servers",
+                        ]
+                    )
+
+                    if is_capability_query:
+                        enhanced_prompt = f"""
+                        The user asked: "{incoming.text}"
+                        
+                        You have connected to the '{server_data["server_name"]}' MCP server:
+                        - Description: {server_data.get("description", "Specialized server")}
+                        - Transport: {server_data.get("transport", "unknown")}
+                        
+                        The user wants to know about the SERVER CAPABILITIES, not execute tasks.
+                        
+                        Please:
+                        1. List the available MCP tools/capabilities on this server
+                        2. Describe what each tool can do
+                        3. Provide examples of how to use the tools
+                        4. Do NOT execute any tools unless specifically requested
+                        
+                        Focus on showing what the user CAN DO with this MCP server.
+                        """
+                    else:
+                        enhanced_prompt = f"""
+                        Original request: {incoming.text}
+                        
+                        You have access to the specialized '{server_data["server_name"]}' MCP server:
+                        - Description: {server_data.get("description", "Specialized server")}
+                        - Transport: {server_data.get("transport", "unknown")}
+                        
+                        Use the tools from this server to fulfill the user's request.
+                        Provide specific, actionable results with relevant data.
+                        """
 
                     result = await llm.generate_str(enhanced_prompt)
 
@@ -1118,6 +1258,43 @@ Write a natural, conversational response that fully addresses the user's request
             self.logger.error(f"❌ Database server search failed: {e}")
             return []
 
+    async def _get_configured_servers(self) -> List[Dict]:
+        """Get MCP servers configured in YAML files."""
+        try:
+            configured_servers = []
+
+            if (
+                self.mcp_app
+                and hasattr(self.mcp_app, "context")
+                and hasattr(self.mcp_app.context, "server_registry")
+            ):
+                registry = self.mcp_app.context.server_registry.registry
+                self.logger.info(f"📋 Found {len(registry)} configured servers in YAML")
+
+                for server_name, server_config in registry.items():
+                    # Convert MCPServerSettings to our discovery format
+                    server_info = {
+                        "server_name": server_name,
+                        "display_name": server_config.name or server_name,
+                        "description": server_config.description
+                        or f"Configured MCP server: {server_name}",
+                        "transport": server_config.transport or "unknown",
+                        "url": server_config.url,
+                        "command": server_config.command,
+                        "args": server_config.args or [],
+                        "source": "yaml_config",
+                    }
+                    configured_servers.append(server_info)
+
+            self.logger.info(
+                f"✅ Retrieved {len(configured_servers)} configured servers"
+            )
+            return configured_servers
+
+        except Exception as e:
+            self.logger.error(f"❌ Failed to get configured servers: {e}")
+            return []
+
     async def _create_dynamic_agent_with_server(
         self, server_data: Dict
     ) -> Optional[Agent]:
@@ -1131,17 +1308,39 @@ Write a natural, conversational response that fully addresses the user's request
 
             from mcp_agent.config import MCPServerSettings
 
+            # Debug: Log the server data being used
+            self.logger.info(
+                f"🔧 Creating dynamic agent with server data: {server_data}"
+            )
+
+            # Extract and validate URL
+            url = server_data.get("url")
+            transport = server_data.get("transport", "sse")
+
+            # Log the URL value for debugging
+            self.logger.info(f"🔧 Server URL: {url}, Transport: {transport}")
+
+            # Validate URL for non-stdio transports
+            if transport in ["sse", "websocket", "streamable_http"] and not url:
+                self.logger.error(f"❌ Missing URL for {transport} transport")
+                return None
+
             # Create dynamic server configuration
             dynamic_config = MCPServerSettings(
                 name=server_data.get("server_name", "dynamic_server"),
                 description=server_data.get(
                     "description", "Dynamically discovered server"
                 ),
-                transport=server_data.get("transport", "sse"),
-                url=server_data.get("url"),
+                transport=transport,
+                url=url,
                 command=server_data.get("command"),
                 args=server_data.get("args", []),
                 terminate_on_close=True,
+            )
+
+            # Log the final config being registered
+            self.logger.info(
+                f"🔧 Registering dynamic server config: name={dynamic_config.name}, transport={dynamic_config.transport}, url={dynamic_config.url}"
             )
 
             # Register the dynamic server

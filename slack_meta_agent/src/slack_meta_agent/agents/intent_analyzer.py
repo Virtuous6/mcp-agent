@@ -216,6 +216,8 @@ INTENT CLASSIFICATION GUIDELINES:
    - creative_request: Writing, content creation, brainstorming
    - research: Information gathering, investigation, fact-finding
    - weather_inquiry: Simple weather requests (should be SINGLE_AGENT)
+   - internal_mcp_discovery: Finding OUR internal MCP servers (database + config) - USE DYNAMIC_DISCOVERY
+   - external_research: Finding external resources on the internet - USE SINGLE_AGENT
 
 2. EXECUTION STRATEGIES:
    - SINGLE_AGENT: One agent can handle this completely (PREFER THIS for simple requests)
@@ -244,6 +246,12 @@ IMPORTANT GUIDELINES:
 - For weather requests, use data_researcher agent with HIGH confidence
 - Only use ORCHESTRATED for genuinely complex multi-step tasks
 - Prefer simplicity over complexity
+
+SPECIAL MCP SERVER RULES:
+- "find all mcp servers", "list all servers", "what servers do we have" → internal_mcp_discovery + DYNAMIC_DISCOVERY
+- "find mcp servers online", "search mcp github", "external mcp directory" → external_research + SINGLE_AGENT + data_researcher  
+- Keywords: "all", "our", "available", "we have" = INTERNAL (use DYNAMIC_DISCOVERY)
+- Keywords: "online", "web", "github", "external", "directory", "examples" = EXTERNAL (use data_researcher)
 
 RESPONSE FORMAT (JSON):
 {{
@@ -456,15 +464,40 @@ Analyze the user message and provide a JSON response with intelligent intent cla
 
         # 🔍 SECONDARY: Look for general MCP/service discovery keywords
         discovery_patterns = [
-            r"\b(find|search|discover|list)\s+(?:mcp\s+)?(servers?|services?|tools?)\b",
-            r"\b(show|get|access)\s+(?:me\s+)?(?:mcp\s+)?(servers?|services?|tools?)\b",
-            r"\b(what|which)\s+(?:mcp\s+)?(servers?|services?|tools?)\b",
+            # Handle "find all mcp servers", "list all servers", etc.
+            r"\b(find|search|discover|list)\s+(?:all\s+)?(?:mcp\s+)?(servers?|services?|tools?)\b",
+            r"\b(show|get|access)\s+(?:me\s+)?(?:all\s+)?(?:mcp\s+)?(servers?|services?|tools?)\b",
+            r"\b(what|which)\s+(?:all\s+)?(?:mcp\s+)?(servers?|services?|tools?)\b",
             r"\b(mcp|server|service)\s+(discovery|exploration|search)\b",
+            # Additional patterns for comprehensive coverage
+            r"\b(find|list|show)\s+(?:all\s+)?(?:available\s+)?(?:mcp\s+)?(servers?|services?)\b",
+            r"\b(?:all\s+)?(?:available\s+)?(mcp\s+)?(servers?|services?)\s+(?:we\s+have|available)\b",
         ]
 
         for pattern in discovery_patterns:
             if re.search(pattern, message_lower):
-                keywords.extend(["mcp", "server", "discovery"])
+                # Check if this is an EXTERNAL search (online, web, etc.)
+                external_indicators = [
+                    "online",
+                    "web",
+                    "internet",
+                    "github",
+                    "directory",
+                    "examples",
+                    "external",
+                ]
+                is_external = any(
+                    indicator in message_lower for indicator in external_indicators
+                )
+
+                if not is_external:
+                    # Only add discovery keywords for INTERNAL searches
+                    keywords.extend(["mcp", "server", "discovery"])
+                    self.logger.info("🔍 Internal MCP discovery request detected")
+                else:
+                    self.logger.info(
+                        "🌐 External MCP search detected - skipping dynamic discovery"
+                    )
 
         # Remove duplicates and empty strings
         keywords = list(set([k for k in keywords if k]))

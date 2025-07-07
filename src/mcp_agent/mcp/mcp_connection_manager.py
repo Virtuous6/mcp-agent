@@ -254,6 +254,15 @@ class MCPConnectionManager(ContextDependent):
             if self._tg_active:
                 try:
                     await self._tg.__aexit__(exc_type, exc_val, exc_tb)
+                except RuntimeError as e:
+                    if "different task" in str(e):
+                        logger.debug(
+                            f"MCPConnectionManager: Task group cleanup across task boundary (expected): {e}"
+                        )
+                    else:
+                        logger.warning(
+                            f"MCPConnectionManager: Task group runtime error: {e}"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"MCPConnectionManager: Error during task group cleanup: {e}"
