@@ -195,18 +195,18 @@ class ModularSlackMetaAgent:
         )
         await self.pool_manager_agent.initialize()
 
-        # 4. Intent Analyzer (depends on registry, tool_discovery)
+        # 4. Intent Analyzer (depends on registry, tool_discovery, pool_manager)
         self.intent_analyzer = IntentAnalyzerAgent(
             registry=self.registry,
             tool_discovery=self.tool_discovery,
-            pool_manager=self.pool_manager,
+            pool_manager=self.pool_manager_agent,
             config=self.config,
         )
         await self.intent_analyzer.initialize()
 
-        # 5. Workflow Manager (depends on pool_manager, registry)
+        # 5. Workflow Manager (depends on registry, tool_discovery, pool_manager)
         self.workflow_manager = WorkflowManagerAgent(
-            pool_manager=self.pool_manager,
+            pool_manager=self.pool_manager_agent,
             db_ops=self.db_ops,
             agent_registry=await self.registry.get_agent_specs(),
             mcp_app=self.mcp_app,
@@ -224,12 +224,16 @@ class ModularSlackMetaAgent:
             workflow_manager=self.workflow_manager,
             mcp_app=self.mcp_app,
         )
+        await self.orchestrator.initialize()
 
     async def _wire_dependencies(self):
         """Wire dependencies between components."""
 
         # Inject orchestrator into slack adapter
         self.slack_adapter.set_orchestrator(self.orchestrator)
+
+        # Inject workflow manager as workflow checker into intent analyzer
+        self.intent_analyzer.set_workflow_checker(self.workflow_manager)
 
         # Set human input callback for pool manager
         if hasattr(self.pool_manager_agent, "set_human_input_callback"):
@@ -256,9 +260,9 @@ class ModularSlackMetaAgent:
         """
         Handle a message directly (useful for testing or non-Slack interfaces).
 
-        This bypasses Slack but uses the same orchestration logic.
+        This uses the new flow: Intent Analysis → Orchestration
         """
-        if not self.orchestrator:
+        if not self.intent_analyzer or not self.orchestrator:
             return "❌ System not properly initialized"
 
         try:
@@ -276,8 +280,18 @@ class ModularSlackMetaAgent:
 
             incoming = IncomingMessage(text=message, context=context, raw_event={})
 
-            # Process through orchestrator
-            result = await self.orchestrator.handle(incoming)
+            # Step 1: Analyze intent first
+            self.logger.info(f"🧠 Analyzing intent for: {message[:50]}...")
+            intent = await self.intent_analyzer.analyze(incoming)
+
+            self.logger.info(
+                f"✅ Intent classified: {intent.name} (confidence: {intent.confidence.value})"
+            )
+
+            # Step 2: Orchestrate execution with intent context
+            self.logger.info(f"🎭 Orchestrating execution with intent: {intent.name}")
+            result = await self.orchestrator.execute_with_intent(incoming, intent)
+
             return result.response
 
         except Exception as e:

@@ -92,46 +92,93 @@ class SlackAdapterAgent(AgentComponent):
             message_ts = event.get("ts")
             thread_ts = event.get("thread_ts")
 
+            self.logger.info(
+                f"🔍 DEBUG: Extracted event data - user: {user_id}, channel: {channel_id}"
+            )
+
             if not user_id or not channel_id or not message_text:
+                self.logger.warning(
+                    f"❌ Missing required fields - user: {user_id}, channel: {channel_id}, text: {bool(message_text)}"
+                )
                 return
 
             # 🚨 PRIORITY: Check if this is a response to pending human input
             if user_id in self.pending_human_inputs and thread_ts:
+                self.logger.info(f"📝 DEBUG: Handling human input response")
                 await self._handle_human_input_response(user_id, message_text)
                 return
 
             # Only process app mentions or direct messages
-            if not (event.get("type") == "app_mention" or channel_id.startswith("D")):
+            event_type = event.get("type")
+            is_app_mention = event_type == "app_mention"
+            is_direct_message = channel_id.startswith("D")
+            # Check for bot mention in message (generic pattern for any bot ID)
+            is_mention_in_message = event_type == "message" and re.search(
+                r"<@U[A-Z0-9]+>", message_text
+            )
+
+            if not (is_app_mention or is_direct_message or is_mention_in_message):
+                self.logger.info(
+                    f"🚫 DEBUG: Ignoring event type: {event_type}, channel: {channel_id}, has_mention: {is_mention_in_message}"
+                )
                 return
+
+            self.logger.info(f"✅ DEBUG: Event validation passed, proceeding...")
 
             # Set current context for human input callbacks
             self.current_user_id = user_id
             self.current_channel_id = channel_id
             self.current_thread_ts = message_ts
 
+            self.logger.info(f"👀 DEBUG: Adding eyes reaction...")
             # Add eyes reaction to show bot received the message
             await self._add_reaction(channel_id, message_ts, "eyes")
+            self.logger.info(f"✅ DEBUG: Eyes reaction added")
 
+            self.logger.info(f"🔄 DEBUG: Normalizing message...")
             # Normalize to platform-agnostic message
             incoming_message = self._normalize_slack_message(event)
             self.logger.info(
                 f"🔄 Normalized message: '{incoming_message.text}' from user {user_id}"
             )
 
-            # Send to orchestrator
+            self.logger.info(f"🎭 DEBUG: Checking orchestrator availability...")
+            # Send through intent analysis → orchestration flow
             if self.orchestrator:
                 self.logger.info(
-                    f"📨 Sending message to orchestrator: {incoming_message.text[:50]}..."
+                    f"✅ DEBUG: Orchestrator found, starting processing..."
+                )
+                self.logger.info(
+                    f"🧠 Starting intent analysis for: {incoming_message.text[:50]}..."
                 )
                 try:
-                    result = await self.orchestrator.handle(incoming_message)
+                    # Step 1: Analyze intent first
+                    self.logger.info("🔍 DEBUG: Calling intent analyzer...")
+                    intent = await self.orchestrator.intent_analyzer.analyze(
+                        incoming_message
+                    )
+                    self.logger.info(
+                        f"✅ Intent classified: {intent.name} (confidence: {intent.confidence.value})"
+                    )
+
+                    # Step 2: Execute with intent context
+                    self.logger.info(
+                        f"🎭 DEBUG: Starting orchestration with intent: {intent.name}"
+                    )
+                    result = await self.orchestrator.execute_with_intent(
+                        incoming_message, intent
+                    )
+
                     self.logger.info(
                         f"✅ Orchestrator returned result: {len(result.response) if result and result.response else 0} chars"
                     )
                     await self._send_result_to_slack(result, incoming_message.context)
                     self.logger.info(f"📤 Response sent to Slack successfully")
                 except Exception as orch_error:
-                    self.logger.error(f"❌ Orchestrator failed: {orch_error}")
+                    self.logger.error(f"❌ Processing failed: {orch_error}")
+                    import traceback
+
+                    self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
                     await self._send_error_to_slack(
                         f"Internal processing error: {str(orch_error)}",
                         channel_id,
