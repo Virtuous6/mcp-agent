@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Any
 
 from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+from mcp_agent.workflows.llm.augmented_llm import RequestParams
 from mcp_agent.workflows.orchestrator.orchestrator import (
     Orchestrator as MCPOrchestrator,
 )
@@ -37,6 +38,13 @@ from ..agents.tool_discovery import ToolDiscoveryAgent
 from ..agents.pool_manager import PoolManagerAgent
 from ..agents.workflow_manager import WorkflowManagerAgent
 from .agent_logging import AgentLoggingMixin
+from .llm_factory import (
+    SmartLLMFactory,
+    create_smart_llm_factory,
+    create_intent_optimized_llm_factory,
+    create_task_optimized_llm_factory,
+)
+from ..utils.context_optimizer import context_optimizer
 
 
 class ExecutionPlan:
@@ -107,6 +115,7 @@ class Orchestrator(AgentComponent):
         pool_manager: PoolManagerAgent,
         workflow_manager: WorkflowManagerAgent,
         mcp_app=None,
+        db_ops=None,
     ):
         super().__init__("Orchestrator")
 
@@ -118,7 +127,14 @@ class Orchestrator(AgentComponent):
         self.workflow_manager = workflow_manager
         self.mcp_app = mcp_app
 
-        # Powerful LLM for plan building (using GPT-4 or similar)
+        # Database operations
+        self.db_ops = db_ops
+        if not self.db_ops:
+            # Initialize database operations if not provided
+            self._initialize_database_operations()
+
+        # Powerful LLM agent for plan building (using GPT-4 or similar)
+        self.planner_agent = None
         self.planner_llm = None
 
         # State tracking
@@ -131,18 +147,91 @@ class Orchestrator(AgentComponent):
             "total_adjustments": 0,
         }
 
-    async def initialize(self):
-        """Initialize the orchestrator with a powerful LLM."""
+    def _initialize_database_operations(self):
+        """Initialize database operations if not provided."""
         try:
-            # Initialize powerful LLM for plan building
-            # We'll use a high-capability model for planning
-            self.planner_llm = OpenAIAugmentedLLM(
-                model="gpt-4o",  # Use most capable model for planning
-                temperature=0.1,  # Lower temperature for more consistent planning
-                max_tokens=4000,  # Higher token limit for detailed plans
+            from ..database.supabase_operations import SupabaseOperations
+            import os
+            from pathlib import Path
+            import yaml
+
+            # Get project ID
+            project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
+
+            # Try to load credentials from secrets file
+            try:
+                secrets_file = (
+                    Path(__file__).parent.parent.parent
+                    / "config"
+                    / "mcp_agent.secrets.yaml"
+                )
+                if secrets_file.exists():
+                    with open(secrets_file, "r") as f:
+                        secrets = yaml.safe_load(f)
+
+                    supabase_config = secrets.get("TRIBEsupabase", {})
+                    anon_key = supabase_config.get("anon_key")
+                    service_role_key = supabase_config.get("service_role_key")
+
+                    # Initialize with credentials
+                    self.db_ops = SupabaseOperations(
+                        supabase_project_id=project_id,
+                        anon_key=anon_key,
+                        service_role_key=service_role_key,
+                    )
+                    self.logger.info(
+                        "✅ Initialized database operations with credentials"
+                    )
+                else:
+                    # Fallback without credentials (will use MCP method)
+                    self.db_ops = SupabaseOperations(supabase_project_id=project_id)
+                    self.logger.info(
+                        "✅ Initialized database operations without credentials (MCP fallback)"
+                    )
+
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not load secrets: {e}, creating basic db_ops"
+                )
+                self.db_ops = SupabaseOperations(supabase_project_id=project_id)
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize database operations: {e}")
+            self.db_ops = None
+
+    async def initialize(self):
+        """Initialize the orchestrator with Smart LLM Factory for powerful planning."""
+        try:
+            # Create a specialized agent for orchestration and planning
+            self.planner_agent = Agent(
+                name="orchestrator_planner",
+                instruction="""You are a master execution planner and strategic coordinator. 
+                Your role is to analyze complex user queries and build optimal execution plans 
+                that ensure complete and accurate responses. You excel at breaking down complex 
+                problems into actionable steps, selecting the right agents for each task, and 
+                ensuring all user needs are met. You are methodical, thorough, and focus on 
+                delivering comprehensive solutions.""",
+                server_names=[],  # Planning doesn't need MCP servers directly
+                context=getattr(self.mcp_app, "context", None)
+                if self.mcp_app
+                else None,
             )
 
-            self.logger.info("🧠 Orchestrator initialized with powerful planning LLM")
+            # Configure high-capability LLM settings that can be overridden by database
+            self.planner_agent.llm_config = {
+                "model": "gpt-4o",  # Use most capable model for planning
+                "temperature": 0.1,  # Lower temperature for consistent planning
+                "max_tokens": 4000,  # Higher token limit for detailed plans
+                "provider": "openai",
+            }
+
+            # Use smart LLM factory for database-driven configuration
+            llm_factory = create_smart_llm_factory(self.planner_agent)
+            self.planner_llm = await self.planner_agent.attach_llm(llm_factory)
+
+            self.logger.info(
+                "🧠 Orchestrator initialized with Smart LLM Factory and database-driven planning configuration"
+            )
 
         except Exception as e:
             self.logger.error(f"Failed to initialize orchestrator: {e}")
@@ -167,6 +256,18 @@ class Orchestrator(AgentComponent):
 
         try:
             self.logger.info(f"🎭 Starting plan execution for: {incoming.text[:50]}...")
+
+            # Handle dynamic discovery execution strategy
+            if intent.execution_strategy == ExecutionStrategy.DYNAMIC_DISCOVERY:
+                self.logger.info(f"🔍 Executing dynamic MCP discovery workflow")
+                return await self._execute_dynamic_discovery(
+                    incoming, intent, start_time
+                )
+
+            # Fast-path execution for simple single-agent queries
+            if self._should_use_fast_path(intent):
+                self.logger.info(f"🚀 Using fast-path execution for simple query")
+                return await self._execute_fast_path(incoming, intent, start_time)
 
             # Step 1: Build execution plan with powerful LLM
             plan = await self._build_execution_plan(incoming, intent, plan_id)
@@ -252,6 +353,128 @@ class Orchestrator(AgentComponent):
             if plan_id in self.active_plans:
                 del self.active_plans[plan_id]
 
+    def _should_use_fast_path(self, intent: Intent) -> bool:
+        """Determine if we should use fast-path execution for simple queries."""
+        # Use fast-path for single-agent queries with high confidence
+        if (
+            intent.execution_strategy == ExecutionStrategy.SINGLE_AGENT
+            and intent.confidence in [ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM]
+            and len(intent.required_agents) == 1
+            and intent.estimated_tasks <= 1
+        ):
+            return True
+
+        # Use fast-path for specific simple intent types
+        simple_intents = [
+            "weather_inquiry",
+            "greeting",
+            "question",
+            "capability_inquiry",
+            "basic_research",
+            "simple_lookup",
+            "factual_question",
+        ]
+        if intent.name in simple_intents:
+            return True
+
+        return False
+
+    async def _execute_fast_path(
+        self, incoming: IncomingMessage, intent: Intent, start_time: datetime
+    ) -> ExecutionResult:
+        """Execute simple queries directly without complex orchestration."""
+        try:
+            agent_type = (
+                intent.required_agents[0]
+                if intent.required_agents
+                else "data_researcher"
+            )
+
+            self.logger.info(f"⚡ Fast-path execution with {agent_type}")
+
+            # Get agent from pool
+            agent = await self.pool_manager.get_agent(
+                agent_type, f"fastpath_{int(start_time.timestamp())}"
+            )
+
+            if not agent:
+                raise Exception(f"Could not get agent of type: {agent_type}")
+
+            try:
+                async with agent:
+                    # Use optimized LLM for fast execution
+                    llm = await self._get_fast_path_llm(agent, intent)
+
+                    # Build simple prompt
+                    prompt = self._build_fast_path_prompt(incoming, intent)
+
+                    # Execute directly
+                    result = await llm.generate_str(prompt)
+
+                    execution_time = (datetime.now() - start_time).total_seconds()
+
+                    self.logger.info(f"✅ Fast-path completed in {execution_time:.2f}s")
+
+                    return ExecutionResult(
+                        success=True,
+                        response=result,
+                        execution_time=execution_time,
+                        intent_confidence=intent.confidence,
+                        agent_count=1,
+                        metadata={
+                            "execution_type": "fast_path",
+                            "agent_type": agent_type,
+                            "intent_name": intent.name,
+                        },
+                    )
+
+            except Exception as e:
+                self.logger.error(f"Fast-path execution failed: {e}")
+                raise
+
+        except Exception as e:
+            execution_time = (datetime.now() - start_time).total_seconds()
+            return ExecutionResult(
+                success=False,
+                response=f"I encountered an error while processing your request: {str(e)}",
+                execution_time=execution_time,
+                intent_confidence=intent.confidence,
+                agent_count=0,
+                error=str(e),
+                metadata={
+                    "execution_type": "fast_path_failed",
+                    "error": str(e),
+                },
+            )
+
+    async def _get_fast_path_llm(self, agent: Agent, intent: Intent):
+        """Get optimized LLM for fast-path execution using database configuration."""
+        # Use the smart factory that respects database settings and optimizes for intent
+        llm_factory = create_intent_optimized_llm_factory(
+            intent_name=intent.name,
+            confidence=intent.confidence.value
+            if hasattr(intent.confidence, "value")
+            else "medium",
+        )
+
+        return await agent.attach_llm(llm_factory)
+
+    def _build_fast_path_prompt(self, incoming: IncomingMessage, intent: Intent) -> str:
+        """Build optimized prompt for fast-path execution."""
+        return f"""
+USER REQUEST: {incoming.text}
+
+INTENT: {intent.name} (confidence: {intent.confidence.value})
+
+INSTRUCTIONS:
+1. Provide a direct, helpful response to the user's request
+2. Be concise but complete
+3. Use your available tools as needed
+4. Focus on accuracy and relevance
+
+Execute this request efficiently and provide a clear response.
+"""
+
     async def _build_execution_plan(
         self, incoming: IncomingMessage, intent: Intent, plan_id: str
     ) -> ExecutionPlan:
@@ -300,14 +523,25 @@ CONTEXT:
 - Channel: {incoming.context.channel_id}
 - Platform: {incoming.context.platform}
 
-Your task is to create a comprehensive execution plan that will fully answer the user's query. You can:
-1. Adjust the suggested agents if needed
-2. Add additional agents for completeness
-3. Create specific tasks with clear inputs
-4. Define success criteria
-5. Plan for validation
+CRITICAL PLANNING PRINCIPLES:
+1. PREFER SIMPLICITY - Don't over-engineer simple requests
+2. For single-agent intents, create ONE task with ONE agent
+3. Only create multiple tasks if genuinely required for complex workflows
+4. Weather queries, basic questions, and simple lookups need ONE task only
+5. Don't create "backend services" or "development tasks" for simple data requests
+6. Focus on DIRECT execution, not elaborate infrastructure
 
-Return a JSON plan with this structure:
+TASK CREATION GUIDELINES:
+- Weather inquiry: ONE task with data_researcher to get weather data
+- Simple question: ONE task with knowledge_agent to answer
+- Basic research: ONE task with data_researcher to find information
+- Only create multiple tasks for genuinely complex multi-step processes
+
+Your task is to create a simple, efficient execution plan that will fully answer the user's query without over-engineering.
+
+IMPORTANT: You MUST return a valid JSON object. Do not include any explanatory text before or after the JSON.
+
+Return ONLY this JSON structure:
 {{
     "analysis": "Your analysis of the query and intent",
     "adjustments": "Any adjustments to the intent analyzer's suggestions",
@@ -315,27 +549,26 @@ Return a JSON plan with this structure:
         {{
             "task_id": "task_1",
             "agent_type": "agent_name",
-            "description": "Specific task description",
-            "inputs": {{"key": "value"}},
-            "dependencies": ["task_id_if_any"]
+            "description": "Direct task description - no backend development",
+            "inputs": {{"query": "{incoming.text}", "intent": "{intent.name}"}},
+            "dependencies": []
         }}
     ],
     "success_criteria": [
-        "Specific criterion 1",
-        "Specific criterion 2"
+        "User query is directly answered",
+        "Response is accurate and helpful"
     ],
-    "reasoning": "Why this plan will fully answer the query"
+    "reasoning": "Simple plan that directly addresses the query without over-engineering"
 }}
 
-Focus on creating a plan that will completely satisfy the user's request with high quality results.
-"""
+Focus on creating a SIMPLE plan that directly answers the user's request. Avoid creating unnecessary complexity."""
 
         try:
             # Get plan from powerful LLM
             plan_response = await self.planner_llm.generate_str(planning_prompt)
 
-            # Parse the plan
-            plan_data = json.loads(plan_response)
+            # Clean and parse the plan response
+            plan_data = self._parse_json_response(plan_response, "planning")
 
             # Create execution plan object
             plan = ExecutionPlan(plan_id, incoming.text, intent)
@@ -449,6 +682,15 @@ Focus on creating a plan that will completely satisfy the user's request with hi
                 )
                 result = await llm.generate_str(task_prompt)
 
+                # Optimize result to prevent context overflow
+                if result and len(result) > 40000:  # ~10k tokens
+                    self.logger.warning(
+                        f"Large result detected ({len(result)} chars), applying context optimization"
+                    )
+                    result = context_optimizer.truncate_large_responses(
+                        result, max_tokens=10000
+                    )
+
                 # Log what the agent did
                 task["logs"].append(
                     {
@@ -481,28 +723,25 @@ Focus on creating a plan that will completely satisfy the user's request with hi
             raise
 
     async def _get_task_optimized_llm(self, agent: Agent, task: Dict[str, Any]):
-        """Get task-optimized LLM for the agent."""
+        """Get task-optimized LLM for the agent using database configuration."""
         agent_type = task["agent_type"]
 
-        # Configure LLM based on agent type and task
+        # Determine task complexity based on agent type
         if agent_type in ["feedback_collector", "capability_inspector"]:
-            # Use faster, cheaper model for simple tasks
-            return await agent.attach_llm(
-                OpenAIAugmentedLLM, model="gpt-4o-mini", temperature=0.3
-            )
+            task_type = "simple"
         elif agent_type in ["financial_analyst", "code_developer"]:
-            # Use more powerful model for complex analysis
-            return await agent.attach_llm(
-                OpenAIAugmentedLLM, model="gpt-4o", temperature=0.1
-            )
+            task_type = "complex"
         elif agent_type in ["data_researcher", "knowledge_agent"]:
-            # Balanced model for research tasks
-            return await agent.attach_llm(
-                OpenAIAugmentedLLM, model="gpt-4o", temperature=0.2
-            )
+            task_type = "research"
         else:
-            # Default configuration
-            return await agent.attach_llm(OpenAIAugmentedLLM)
+            task_type = "general"
+
+        # Use the smart factory that respects database settings and optimizes for task type
+        llm_factory = create_task_optimized_llm_factory(
+            task_type=task_type, agent_type=agent_type
+        )
+
+        return await agent.attach_llm(llm_factory)
 
     def _build_task_prompt(self, task: Dict[str, Any], plan: ExecutionPlan) -> str:
         """Build a specific prompt for the task."""
@@ -566,7 +805,7 @@ Return JSON:
 
         try:
             validation_response = await self.planner_llm.generate_str(validation_prompt)
-            return json.loads(validation_response)
+            return self._parse_json_response(validation_response, "validation")
         except Exception as e:
             self.logger.error(f"Validation failed: {e}")
             return {
@@ -610,10 +849,12 @@ Return JSON:
 
         try:
             adjustment_response = await self.planner_llm.generate_str(adjustment_prompt)
-            adjustment_data = json.loads(adjustment_response)
+            adjustment_data = self._parse_json_response(
+                adjustment_response, "adjustment"
+            )
 
             # Add adjustment tasks to plan
-            for task_data in adjustment_data["additional_tasks"]:
+            for task_data in adjustment_data.get("additional_tasks", []):
                 plan.add_task(
                     task_id=task_data["task_id"],
                     agent_type=task_data["agent_type"],
@@ -643,13 +884,25 @@ Return JSON:
     ) -> str:
         """Compile the final response from all execution results."""
 
+        # Optimize results to prevent context overflow
+        optimized_results = {}
+        for task_id, result in results.items():
+            if isinstance(result, dict) and "result" in result:
+                result_content = result["result"]
+                if result_content and len(result_content) > 30000:  # ~7.5k tokens
+                    self.logger.warning(f"Optimizing large result for task {task_id}")
+                    result["result"] = context_optimizer.truncate_large_responses(
+                        result_content, max_tokens=7500
+                    )
+            optimized_results[task_id] = result
+
         compilation_prompt = f"""
 Compile a comprehensive final response from the execution results.
 
 ORIGINAL QUERY: "{plan.original_query}"
 
 EXECUTION RESULTS:
-{json.dumps(results, indent=2)}
+{json.dumps(optimized_results, indent=2)}
 
 VALIDATION:
 {json.dumps(validation, indent=2)}
@@ -723,6 +976,210 @@ Write a natural, conversational response that fully addresses the user's request
                 (current_avg * (total_successful - 1)) + execution_time
             ) / total_successful
 
+    async def _execute_dynamic_discovery(
+        self, incoming: IncomingMessage, intent: Intent, start_time: datetime
+    ) -> ExecutionResult:
+        """Execute dynamic MCP server discovery workflow."""
+        try:
+            keywords = intent.payload.get("discovery_keywords", [])
+            self.logger.info(f"🔍 Starting dynamic discovery for keywords: {keywords}")
+
+            # Find best match from database
+            discovered_servers = await self._find_database_servers(keywords)
+
+            if not discovered_servers:
+                return ExecutionResult(
+                    success=False,
+                    response=f"⚠️ No MCP servers found for '{', '.join(keywords)}'",
+                    execution_time=(datetime.now() - start_time).total_seconds(),
+                    intent_confidence=intent.confidence,
+                    agent_count=0,
+                    metadata={
+                        "discovery_keywords": keywords,
+                        "servers_found": 0,
+                    },
+                )
+
+            # Use the first discovered server
+            server_data = discovered_servers[0]
+            self.logger.info(f"✅ Using database server '{server_data['server_name']}'")
+
+            # Create dynamic agent with the database server
+            dynamic_agent = await self._create_dynamic_agent_with_server(server_data)
+
+            if not dynamic_agent:
+                return ExecutionResult(
+                    success=False,
+                    response=f"❌ Failed to create agent for database server '{server_data['server_name']}'",
+                    execution_time=(datetime.now() - start_time).total_seconds(),
+                    intent_confidence=intent.confidence,
+                    agent_count=0,
+                    metadata={
+                        "discovery_keywords": keywords,
+                        "server_name": server_data["server_name"],
+                        "error": "agent_creation_failed",
+                    },
+                )
+
+            try:
+                async with dynamic_agent:
+                    # Get optimized LLM for the task
+                    llm = await self._get_fast_path_llm(dynamic_agent, intent)
+
+                    enhanced_prompt = f"""
+                    Original request: {incoming.text}
+                    
+                    You have access to the specialized '{server_data["server_name"]}' MCP server:
+                    - Description: {server_data.get("description", "Specialized server")}
+                    - Transport: {server_data.get("transport", "unknown")}
+                    
+                    Use the tools from this server to fulfill the user's request.
+                    Provide specific, actionable results with relevant data.
+                    """
+
+                    result = await llm.generate_str(enhanced_prompt)
+
+                    execution_time = (datetime.now() - start_time).total_seconds()
+
+                    self.logger.info(
+                        f"✅ Dynamic discovery completed in {execution_time:.2f}s"
+                    )
+
+                    return ExecutionResult(
+                        success=True,
+                        response=result,
+                        execution_time=execution_time,
+                        intent_confidence=intent.confidence,
+                        agent_count=1,
+                        metadata={
+                            "execution_type": "dynamic_discovery",
+                            "discovery_keywords": keywords,
+                            "server_name": server_data["server_name"],
+                            "server_transport": server_data.get("transport", "unknown"),
+                        },
+                    )
+
+            finally:
+                # Clean up dynamic server registration
+                await self._cleanup_dynamic_server()
+
+        except Exception as e:
+            execution_time = (datetime.now() - start_time).total_seconds()
+            self.logger.error(f"Dynamic discovery failed: {e}")
+
+            return ExecutionResult(
+                success=False,
+                response=f"❌ Dynamic discovery failed: {str(e)}",
+                execution_time=execution_time,
+                intent_confidence=intent.confidence,
+                agent_count=0,
+                error=str(e),
+                metadata={
+                    "execution_type": "dynamic_discovery_failed",
+                    "discovery_keywords": keywords,
+                    "error": str(e),
+                },
+            )
+
+    async def _find_database_servers(self, keywords: List[str]) -> List[Dict]:
+        """Find MCP servers from database based on keywords."""
+        try:
+            self.logger.info(f"🔍 Database server discovery for keywords: {keywords}")
+
+            # Use database operations if available
+            if self.db_ops:
+                self.logger.info("✅ Using database operations for server discovery")
+                servers = await self.db_ops.discover_mcp_servers(keywords)
+                if servers:
+                    self.logger.info(f"🎯 Found {len(servers)} servers from database")
+                    return servers
+                else:
+                    self.logger.info("No servers found in database for keywords")
+                    return []
+
+            # Try pool manager method if db_ops not available
+            if self.pool_manager and hasattr(
+                self.pool_manager, "find_servers_by_keywords"
+            ):
+                self.logger.info("✅ Using pool manager for server discovery")
+                result = await self.pool_manager.find_servers_by_keywords(keywords)
+                if result.get("success"):
+                    return result.get("data", [])
+                else:
+                    self.logger.warning(
+                        f"Pool manager discovery failed: {result.get('error')}"
+                    )
+                    return []
+
+            self.logger.warning("❌ No database discovery methods available")
+            return []
+
+        except Exception as e:
+            self.logger.error(f"❌ Database server search failed: {e}")
+            return []
+
+    async def _create_dynamic_agent_with_server(
+        self, server_data: Dict
+    ) -> Optional[Agent]:
+        """Create a dynamic agent with the specified server."""
+        try:
+            if not self.mcp_app or not hasattr(self.mcp_app, "context"):
+                self.logger.error(
+                    "No MCP app context available for dynamic agent creation"
+                )
+                return None
+
+            from mcp_agent.config import MCPServerSettings
+
+            # Create dynamic server configuration
+            dynamic_config = MCPServerSettings(
+                name=server_data.get("server_name", "dynamic_server"),
+                description=server_data.get(
+                    "description", "Dynamically discovered server"
+                ),
+                transport=server_data.get("transport", "sse"),
+                url=server_data.get("url"),
+                command=server_data.get("command"),
+                args=server_data.get("args", []),
+                terminate_on_close=True,
+            )
+
+            # Register the dynamic server
+            self.mcp_app.context.server_registry.registry["dynamic_server"] = (
+                dynamic_config
+            )
+
+            # Create agent with the dynamic server
+            agent = Agent(
+                name=f"dynamic_{server_data['server_name']}_agent",
+                instruction=f"Agent with access to {server_data['server_name']} MCP server",
+                server_names=["dynamic_server"],
+                context=self.mcp_app.context,
+            )
+
+            self.logger.info(
+                f"✅ Created dynamic agent for {server_data['server_name']}"
+            )
+            return agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create dynamic agent: {e}")
+            return None
+
+    async def _cleanup_dynamic_server(self):
+        """Clean up dynamic server registration."""
+        try:
+            if (
+                self.mcp_app
+                and hasattr(self.mcp_app, "context")
+                and hasattr(self.mcp_app.context, "server_registry")
+                and "dynamic_server" in self.mcp_app.context.server_registry.registry
+            ):
+                del self.mcp_app.context.server_registry.registry["dynamic_server"]
+                self.logger.debug("🧹 Cleaned up dynamic server registration")
+        except Exception as e:
+            self.logger.warning(f"Dynamic server cleanup warning: {e}")
+
     async def health_check(self) -> Dict[str, Any]:
         """Check orchestrator and all component health."""
         base_health = await super().health_check()
@@ -748,7 +1205,34 @@ Write a natural, conversational response that fully addresses the user's request
             **base_health,
             "active_plans": len(self.active_plans),
             "execution_metrics": self.execution_metrics,
+            "planner_agent_available": self.planner_agent is not None,
             "planner_llm_available": self.planner_llm is not None,
             "mcp_app_available": self.mcp_app is not None,
             "components": component_health,
         }
+
+    def _parse_json_response(self, response: str, context: str) -> Dict[str, Any]:
+        """Parse a JSON response with robust error handling."""
+        try:
+            # Clean the response by removing any extra text
+            cleaned_response = response.strip()
+
+            # Try to find JSON within the response
+            json_start = cleaned_response.find("{")
+            json_end = cleaned_response.rfind("}") + 1
+
+            if json_start >= 0 and json_end > json_start:
+                json_str = cleaned_response[json_start:json_end]
+                return json.loads(json_str)
+            else:
+                # If no JSON found, try parsing the whole response
+                return json.loads(cleaned_response)
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON decode error in {context}: {e}")
+            self.logger.debug(f"Raw {context} response: {response}")
+            return {}
+        except Exception as e:
+            self.logger.error(f"Failed to parse {context} response: {e}")
+            self.logger.debug(f"Raw {context} response: {response}")
+            return {}

@@ -10,10 +10,11 @@ This component handles:
 Extracted from SlackMetaAgent to provide clean separation of concerns.
 """
 
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from datetime import datetime
 
-from ..core.types import AgentSpec, AgentRegistry, AgentComponent
+from ..core.types import AgentComponent
+from ..models import AgentSpec, EnhancedAgentSpec
 
 
 class AgentRegistryAgent(AgentComponent):
@@ -35,14 +36,20 @@ class AgentRegistryAgent(AgentComponent):
         self.cache_ttl = cache_ttl
 
         # Cache management
-        self._registry_cache: Optional[AgentRegistry] = None
+        self._registry_cache: Optional[Dict[str, AgentSpec]] = None
         self._cache_timestamp: Optional[datetime] = None
-        self._static_registry: Optional[AgentRegistry] = None
+        self._static_registry: Optional[Dict[str, AgentSpec]] = None
 
         # Metrics
         self._load_count = 0
         self._cache_hits = 0
         self._cache_misses = 0
+
+        # Agent registries
+        self.agents: Dict[str, AgentSpec] = {}
+        self.enhanced_agents: Dict[str, EnhancedAgentSpec] = {}
+        self.agent_index: Dict[str, List[str]] = {}  # capability -> [agent_names]
+        self._initialize_agents()
 
     async def initialize(self) -> bool:
         """Initialize the agent registry."""
@@ -77,7 +84,7 @@ class AgentRegistryAgent(AgentComponent):
             self.logger.error(f"Failed to initialize agent registry: {e}")
             return False
 
-    async def get_agent_specs(self) -> AgentRegistry:
+    async def get_agent_specs(self) -> Dict[str, AgentSpec]:
         """
         Get current agent specifications with intelligent caching.
 
@@ -249,7 +256,7 @@ class AgentRegistryAgent(AgentComponent):
         self._registry_cache = None
         self._cache_timestamp = None
 
-    async def _load_dynamic_registry(self) -> Optional[AgentRegistry]:
+    async def _load_dynamic_registry(self) -> Optional[Dict[str, AgentSpec]]:
         """Load agent definitions from database."""
         if not self.pool_manager:
             return None
@@ -272,9 +279,7 @@ class AgentRegistryAgent(AgentComponent):
                         instruction=agent_data["instruction"],
                         server_names=server_names,
                         capabilities=agent_data.get("capabilities", []),
-                        metadata=agent_data.get("metadata", {}),
                         is_dynamic=True,
-                        database_id=agent_data.get("id"),
                     )
 
                 return registry
@@ -288,7 +293,7 @@ class AgentRegistryAgent(AgentComponent):
             self.logger.error(f"Failed to load agents from database: {e}")
             return None
 
-    def _load_static_registry(self) -> AgentRegistry:
+    def _load_static_registry(self) -> Dict[str, AgentSpec]:
         """Load static agent definitions as fallback."""
         return {
             "capability_inspector": AgentSpec(
@@ -549,3 +554,165 @@ class AgentRegistryAgent(AgentComponent):
             "pool_manager_status": "available" if self.pool_manager else "unavailable",
             "cache_status": "valid" if self._is_cache_valid() else "invalid",
         }
+
+    def _initialize_agents(self):
+        """Initialize agent registry with enhanced specs"""
+
+        # Define enhanced agent specifications
+        self.enhanced_agents = {
+            "intent_analyzer": EnhancedAgentSpec(
+                id="intent_analyzer",
+                name="Intent Classification Specialist",
+                role="Analyze user messages and classify intent with high accuracy",
+                backstory="You are a linguistic expert trained in understanding user intent across various communication styles. You've analyzed millions of conversations and can quickly identify patterns, context, and underlying needs.",
+                goal="Accurately classify user intent to enable optimal agent selection and execution strategy",
+                llm_model="gpt-4o-mini",
+                temperature=0.1,
+                tools=["pattern_matcher", "context_analyzer"],
+                constraints=[
+                    "Prefer SINGLE_AGENT for simple requests",
+                    "Only suggest ORCHESTRATED for genuinely complex multi-step tasks",
+                    "Always provide confidence assessment",
+                ],
+                system_prompt="You are an expert at understanding user intent. Focus on: 1) Identifying the core request, 2) Determining complexity, 3) Selecting appropriate execution strategy.",
+                capabilities=["intent_classification", "complexity_assessment"],
+                is_dynamic=False,
+            ),
+            "orchestrator": EnhancedAgentSpec(
+                id="orchestrator",
+                name="Master Execution Planner",
+                role="Build and execute sophisticated multi-agent plans",
+                backstory="You are a strategic mastermind with deep experience in project management and systems thinking. You excel at breaking down complex problems into actionable steps and coordinating teams.",
+                goal="Ensure every user query is answered completely through optimal agent coordination",
+                llm_model="gpt-4o",
+                temperature=0.1,
+                allow_delegation=True,
+                tools=["plan_builder", "task_monitor", "result_validator"],
+                constraints=[
+                    "Build minimal but complete plans",
+                    "Validate results match user needs",
+                    "Monitor execution for quality",
+                ],
+                system_prompt="You are the execution brain. Your job is to: 1) Analyze queries deeply, 2) Build minimal but complete plans, 3) Monitor execution, 4) Validate results match user needs.",
+                few_shot_examples=[
+                    {
+                        "query": "What's the weather in NYC?",
+                        "response": "Single task with data_researcher to fetch current NYC weather",
+                    }
+                ],
+                capabilities=[
+                    "plan_building",
+                    "task_orchestration",
+                    "result_validation",
+                ],
+                is_dynamic=False,
+            ),
+            "data_researcher": EnhancedAgentSpec(
+                id="data_researcher",
+                name="Senior Research Analyst",
+                role="Gather real-time data and conduct thorough research",
+                backstory="You are a meticulous researcher with a background in investigative journalism and data science. You never accept surface-level information and always dig deeper to find accurate, current data.",
+                goal="Provide accurate, real-time information with proper sources",
+                llm_model="gpt-4o",
+                temperature=0.2,
+                tools=["brave_search", "fetch", "supabase"],
+                constraints=[
+                    "Always use tools for current data",
+                    "Provide specific numbers and details",
+                    "Include data freshness timestamps",
+                ],
+                system_prompt="You MUST use your tools to get real-time data. Never guess or use training data for current information. Always: 1) Search for sources, 2) Fetch actual data, 3) Provide specific details with timestamps.",
+                capabilities=["research", "data_analysis", "report_generation"],
+                is_dynamic=False,
+            ),
+            "supabase_analyst": EnhancedAgentSpec(
+                id="supabase_analyst",
+                name="Database Architecture Expert",
+                role="Analyze and manage Supabase database schemas and data",
+                backstory="You are a database architect with deep expertise in PostgreSQL and Supabase. You've designed and optimized hundreds of database schemas and understand the intricacies of data modeling, performance tuning, and security.",
+                goal="Provide expert database analysis, optimization, and management for Supabase projects",
+                llm_model="gpt-4o",
+                temperature=0.1,
+                tools=["supabase"],
+                constraints=[
+                    "Always verify schema before operations",
+                    "Provide performance implications",
+                    "Consider security and RLS policies",
+                ],
+                system_prompt="You are a Supabase expert. Focus on: 1) Analyzing existing schemas, 2) Optimizing queries, 3) Ensuring security best practices, 4) Providing clear explanations of database operations.",
+                capabilities=[
+                    "database_analysis",
+                    "schema_design",
+                    "query_optimization",
+                    "data_management",
+                ],
+                is_dynamic=False,
+            ),
+            # ... add more enhanced specs for other agents
+        }
+
+        # Convert enhanced specs to legacy specs for backward compatibility
+        for agent_id, enhanced_spec in self.enhanced_agents.items():
+            self.agents[agent_id] = enhanced_spec.to_legacy_spec()
+
+        # Also include legacy specs that haven't been enhanced yet
+        legacy_agents = {
+            # ... existing code ...
+        }
+
+    async def load_agent_spec(self, agent_id: str) -> Optional[EnhancedAgentSpec]:
+        """Load enhanced agent spec from database or fallback to code."""
+        try:
+            # Try database first if pool_manager is available
+            if self.pool_manager and hasattr(self.pool_manager, "supabase_client"):
+                response = (
+                    await self.pool_manager.supabase_client.table("agent_specs")
+                    .select("*")
+                    .eq("id", agent_id)
+                    .single()
+                    .execute()
+                )
+                if response.data:
+                    return EnhancedAgentSpec.from_dict(response.data)
+        except Exception as e:
+            self.logger.warning(f"Could not load from DB: {e}")
+
+        # Fallback to enhanced static specs
+        return self.enhanced_agents.get(agent_id)
+
+    async def save_agent_spec(self, spec: EnhancedAgentSpec) -> bool:
+        """Save or update an agent spec in the database."""
+        try:
+            if self.pool_manager and hasattr(self.pool_manager, "supabase_client"):
+                data = spec.to_dict()
+                response = (
+                    await self.pool_manager.supabase_client.table("agent_specs")
+                    .upsert(data)
+                    .execute()
+                )
+                return bool(response.data)
+        except Exception as e:
+            self.logger.error(f"Failed to save agent spec: {e}")
+        return False
+
+    async def refresh_specs_from_db(self):
+        """Refresh all agent specs from database."""
+        try:
+            if self.pool_manager and hasattr(self.pool_manager, "supabase_client"):
+                response = (
+                    await self.pool_manager.supabase_client.table("agent_specs")
+                    .select("*")
+                    .execute()
+                )
+                if response.data:
+                    for spec_data in response.data:
+                        spec = EnhancedAgentSpec.from_dict(spec_data)
+                        self.enhanced_agents[spec.id] = spec
+                        # Also update legacy specs for compatibility
+                        self.agents[spec.id] = spec.to_legacy_spec()
+                    self._build_capability_index()
+                    self.logger.info(
+                        f"Loaded {len(response.data)} agent specs from database"
+                    )
+        except Exception as e:
+            self.logger.warning(f"Failed to refresh specs from DB: {e}")

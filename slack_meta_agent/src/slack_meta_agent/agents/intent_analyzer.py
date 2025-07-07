@@ -15,6 +15,7 @@ import json
 from typing import Dict, List, Optional, Any
 
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+from mcp_agent.agents.agent import Agent
 
 from ..core.types import (
     Intent,
@@ -23,6 +24,7 @@ from ..core.types import (
     ConfidenceLevel,
     AgentComponent,
 )
+from ..core.llm_factory import SmartLLMFactory, create_smart_llm_factory
 
 
 class IntentAnalyzerAgent(AgentComponent):
@@ -58,24 +60,45 @@ class IntentAnalyzerAgent(AgentComponent):
             except:
                 self.config = self._default_config()
 
-        # LLM for intent classification
+        # LLM agent for intent classification
+        self.intent_agent = None
         self.intent_llm = None
 
         # Workflow checker (optional - for database-driven workflows)
         self._workflow_checker = None
 
+        # Dynamic discovery components
+        self.mcp_discovery = None  # Will be set if discovery is available
+
     async def initialize(self):
-        """Initialize the intent analyzer with LLM."""
+        """Initialize the intent analyzer with Smart LLM Factory."""
         try:
-            # Initialize LLM for intent classification
-            self.intent_llm = OpenAIAugmentedLLM(
-                model="gpt-4o-mini",  # Fast and efficient for classification
-                temperature=0.1,  # Low temperature for consistent classification
-                max_tokens=1000,  # Sufficient for intent analysis
+            # Create an agent specifically for intent classification
+            # This agent will have its own enhanced configuration from database
+            self.intent_agent = Agent(
+                name="intent_analyzer_llm",
+                instruction="""You are an expert intent classifier for a multi-agent AI system. 
+                Your role is to analyze user messages and accurately classify their intent to enable 
+                optimal agent selection and execution strategy. You excel at understanding context, 
+                nuance, and determining the complexity level of requests.""",
+                server_names=[],  # Intent analysis doesn't need MCP servers
+                context=getattr(self, "context", None),
             )
 
+            # Add LLM configuration that can be overridden by database settings
+            self.intent_agent.llm_config = {
+                "model": "gpt-4o-mini",  # Fast and efficient for classification
+                "temperature": 0.1,  # Low temperature for consistent classification
+                "max_tokens": 1000,  # Sufficient for intent analysis
+                "provider": "openai",
+            }
+
+            # Use smart LLM factory for database-driven configuration
+            llm_factory = create_smart_llm_factory(self.intent_agent)
+            self.intent_llm = await self.intent_agent.attach_llm(llm_factory)
+
             self.logger.info(
-                "🧠 Intent analyzer initialized with LLM-based classification"
+                "🧠 Intent analyzer initialized with Smart LLM Factory and database-driven configuration"
             )
 
         except Exception as e:
@@ -88,10 +111,11 @@ class IntentAnalyzerAgent(AgentComponent):
 
     async def analyze(self, message: IncomingMessage) -> Intent:
         """
-        Analyze user intent using LLM-based classification.
+        Analyze user intent using LLM-based classification with dynamic MCP discovery.
 
         This is much more intelligent than pattern matching and can understand
-        context, nuance, and complex requests.
+        context, nuance, and complex requests. It also checks for dynamic MCP
+        server discovery needs.
         """
         text = message.text
         context = message.context
@@ -99,6 +123,20 @@ class IntentAnalyzerAgent(AgentComponent):
         self.logger.info(f"🧠 Analyzing intent with LLM for: {text[:50]}...")
 
         try:
+            # 🔍 FIRST: Check for dynamic MCP server discovery needs
+            discovery_keywords = self._extract_discovery_keywords_from_message(text)
+            if discovery_keywords:
+                discovery_intent = await self._check_dynamic_discovery_needs(
+                    text, discovery_keywords
+                )
+                if discovery_intent:
+                    self.logger.info(
+                        f"🔍 Dynamic MCP discovery detected: {discovery_intent.name} "
+                        f"(keywords: {discovery_keywords})"
+                    )
+                    return discovery_intent
+
+            # 🧠 SECOND: Standard LLM intent classification
             # Get available agents and tools for context
             available_agents = await self._get_available_agents()
             available_tools = self._get_available_tools()
@@ -177,10 +215,11 @@ INTENT CLASSIFICATION GUIDELINES:
    - technical_support: Help with technical issues, troubleshooting
    - creative_request: Writing, content creation, brainstorming
    - research: Information gathering, investigation, fact-finding
+   - weather_inquiry: Simple weather requests (should be SINGLE_AGENT)
 
 2. EXECUTION STRATEGIES:
-   - SINGLE_AGENT: One agent can handle this completely
-   - ORCHESTRATED: Multiple agents need to collaborate
+   - SINGLE_AGENT: One agent can handle this completely (PREFER THIS for simple requests)
+   - ORCHESTRATED: Multiple agents need to collaborate (ONLY for complex multi-step tasks)
    - WORKFLOW: Database-driven multi-step process
    - DYNAMIC_DISCOVERY: Need to discover new tools/capabilities
 
@@ -191,7 +230,7 @@ INTENT CLASSIFICATION GUIDELINES:
 
 4. AGENT SELECTION:
    Choose the most appropriate agents based on the request:
-   - data_researcher: General research, API calls, data gathering
+   - data_researcher: General research, API calls, data gathering, weather queries
    - knowledge_agent: Factual questions, definitions, explanations
    - capability_inspector: System capabilities, tool discovery
    - feedback_collector: User feedback, suggestions, issues
@@ -200,12 +239,18 @@ INTENT CLASSIFICATION GUIDELINES:
    - airtable_manager: Database operations, record management
    - automation_specialist: Workflow automation, integrations
 
+IMPORTANT GUIDELINES:
+- For simple queries (weather, basic facts, single questions), use SINGLE_AGENT strategy
+- For weather requests, use data_researcher agent with HIGH confidence
+- Only use ORCHESTRATED for genuinely complex multi-step tasks
+- Prefer simplicity over complexity
+
 RESPONSE FORMAT (JSON):
 {{
     "intent_name": "specific_intent_name",
     "intent_category": "category_from_list_above", 
-    "required_agents": ["agent1", "agent2"],
-    "execution_strategy": "SINGLE_AGENT|ORCHESTRATED|WORKFLOW|DYNAMIC_DISCOVERY",
+    "required_agents": ["agent1"],
+    "execution_strategy": "SINGLE_AGENT",
     "confidence": "HIGH|MEDIUM|LOW",
     "reasoning": "Clear explanation of why this classification was chosen",
     "priority": "high|medium|low",
@@ -216,7 +261,7 @@ RESPONSE FORMAT (JSON):
     }}
 }}
 
-Analyze the user message and provide a JSON response with intelligent intent classification."""
+Analyze the user message and provide a JSON response with intelligent intent classification. PREFER SINGLE_AGENT strategy for simple requests."""
 
     async def _get_available_agents(self) -> List[str]:
         """Get list of available agents."""
@@ -360,6 +405,146 @@ Analyze the user message and provide a JSON response with intelligent intent cla
             "cache_ttl_seconds": 300,
         }
 
+    # ======= DYNAMIC MCP DISCOVERY METHODS =======
+
+    def _extract_discovery_keywords_from_message(self, message: str) -> List[str]:
+        """Extract keywords from message that might indicate need for dynamic MCP server discovery"""
+        message_lower = message.lower()
+        keywords = []
+
+        # 🎯 PRIORITY: Extract organization-specific qualifiers (like "ARC supabase")
+        # Look for patterns like "our [ORG] [service]" or "[ORG] [service]"
+        org_service_patterns = [
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(supabase|database|db)\b",  # "our ARC supabase", "ARC supabase"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(airtable|air table)\b",  # "our ACME airtable"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(n8n|automation)\b",  # "our CORP n8n"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(api|webhook|integration)\b",  # "our ORG api"
+            r"\b(?:our\s+)?([A-Z]{2,10})\s+(server|service)\b",  # "our ARC server"
+            r"\b(arc|advertising)\s+(supabase|database)\b",  # "arc supabase", "advertising database"
+            r"\b(arc_supabase|arc_database|ghl_dynamic)\b",  # "arc_supabase", "ghl_dynamic" (compound forms)
+        ]
+
+        for pattern in org_service_patterns:
+            matches = re.findall(pattern, message, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple) and len(match) == 2:
+                    org_name = match[0].lower()  # Organization name (e.g., "arc")
+                    service_type = match[1].lower()  # Service type (e.g., "supabase")
+
+                    # Add both individual keywords and compound qualifier
+                    keywords.extend([org_name, service_type])
+                    keywords.append(
+                        f"{org_name}_{service_type}"
+                    )  # e.g., "arc_supabase"
+
+                    self.logger.info(
+                        f"🎯 Extracted qualified service: {org_name} {service_type}"
+                    )
+                elif isinstance(match, str):
+                    # Handle compound form matches like "arc_supabase"
+                    compound_service = match.lower()
+                    keywords.append(compound_service)
+
+                    # Also extract parts if it contains underscore
+                    if "_" in compound_service:
+                        parts = compound_service.split("_")
+                        keywords.extend(parts)
+
+                    self.logger.info(
+                        f"🎯 Extracted compound service: {compound_service}"
+                    )
+
+        # 🔍 SECONDARY: Look for general MCP/service discovery keywords
+        discovery_patterns = [
+            r"\b(find|search|discover|list)\s+(?:mcp\s+)?(servers?|services?|tools?)\b",
+            r"\b(show|get|access)\s+(?:me\s+)?(?:mcp\s+)?(servers?|services?|tools?)\b",
+            r"\b(what|which)\s+(?:mcp\s+)?(servers?|services?|tools?)\b",
+            r"\b(mcp|server|service)\s+(discovery|exploration|search)\b",
+        ]
+
+        for pattern in discovery_patterns:
+            if re.search(pattern, message_lower):
+                keywords.extend(["mcp", "server", "discovery"])
+
+        # Remove duplicates and empty strings
+        keywords = list(set([k for k in keywords if k]))
+
+        if keywords:
+            self.logger.info(f"🔍 Extracted discovery keywords: {keywords}")
+
+        return keywords
+
+    async def _check_dynamic_discovery_needs(
+        self, message: str, keywords: List[str]
+    ) -> Optional[Intent]:
+        """Check if the message requires dynamic MCP server discovery"""
+        if not keywords:
+            return None
+
+        # Check if we have potential database matches for these keywords
+        needs_discovery = await self._should_trigger_dynamic_discovery(
+            keywords, message
+        )
+
+        if needs_discovery:
+            return Intent(
+                name="dynamic_mcp_discovery",
+                required_agents=["data_researcher"],  # Use reliable agent that exists
+                execution_strategy=ExecutionStrategy.DYNAMIC_DISCOVERY,
+                confidence=ConfidenceLevel.HIGH,
+                reasoning=f"Detected organization-specific or MCP server patterns requiring database discovery",
+                priority="high",
+                estimated_tasks=1,
+                payload={
+                    "discovery_keywords": keywords,
+                    "original_message": message,
+                    "qualified_services": any("_" in k for k in keywords),
+                },
+            )
+
+        return None
+
+    async def _should_trigger_dynamic_discovery(
+        self, keywords: List[str], message: str
+    ) -> bool:
+        """Determine if we should trigger dynamic MCP server discovery"""
+
+        # High-priority triggers
+        high_priority_keywords = ["arc_supabase", "arc", "advertising"]
+        if any(keyword in keywords for keyword in high_priority_keywords):
+            self.logger.info(f"🎯 High-priority discovery trigger detected: {keywords}")
+            return True
+
+        # Check for compound organization keywords (like "arc_supabase")
+        compound_keywords = [k for k in keywords if "_" in k]
+        if compound_keywords:
+            self.logger.info(
+                f"🔍 Compound organization keywords detected: {compound_keywords}"
+            )
+            return True
+
+        # Check for explicit MCP discovery requests
+        discovery_indicators = [
+            "find",
+            "search",
+            "discover",
+            "list",
+            "show",
+            "get",
+            "access",
+        ]
+        mcp_indicators = ["mcp", "server", "service", "tool"]
+
+        message_lower = message.lower()
+        has_discovery = any(word in message_lower for word in discovery_indicators)
+        has_mcp = any(word in message_lower for word in mcp_indicators)
+
+        if has_discovery and has_mcp:
+            self.logger.info("🔍 Explicit MCP discovery request detected")
+            return True
+
+        return False
+
     async def health_check(self) -> Dict[str, Any]:
         """Check component health."""
         return {
@@ -369,4 +554,5 @@ Analyze the user message and provide a JSON response with intelligent intent cla
             "workflow_checker": self._workflow_checker is not None,
             "registry_available": self.registry is not None,
             "tool_discovery_available": self.tool_discovery is not None,
+            "dynamic_discovery_available": self.mcp_discovery is not None,
         }

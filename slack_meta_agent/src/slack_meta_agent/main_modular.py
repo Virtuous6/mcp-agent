@@ -72,6 +72,7 @@ class ModularSlackMetaAgent:
             anon_key = None
             service_role_key = None
             supabase_url = None
+            supabase_access_token = None
 
             # Try to load from secrets YAML file
             secrets_paths = [
@@ -86,15 +87,85 @@ class ModularSlackMetaAgent:
 
                     with open(secrets_file, "r") as f:
                         secrets = yaml.safe_load(f)
-                        if "supabase" in secrets:
+
+                        # First try TRIBEsupabase section (our current setup)
+                        if "TRIBEsupabase" in secrets:
+                            tribe_config = secrets["TRIBEsupabase"]
+                            anon_key = tribe_config.get("anon_key")
+                            service_role_key = tribe_config.get("service_role_key")
+                            supabase_url = tribe_config.get("url")
+                            self.logger.info(
+                                f"📄 Loaded Supabase credentials from TRIBEsupabase section in {secrets_file}"
+                            )
+
+                        # Also check for MCP server environment variables
+                        if "mcp" in secrets and "servers" in secrets["mcp"]:
+                            mcp_servers = secrets["mcp"]["servers"]
+
+                            # Set up Supabase MCP server environment variables
+                            if "TRIBEsupabase" in mcp_servers:
+                                supabase_env = mcp_servers["TRIBEsupabase"].get(
+                                    "env", {}
+                                )
+                                if "SUPABASE_ACCESS_TOKEN" in supabase_env:
+                                    supabase_access_token = supabase_env[
+                                        "SUPABASE_ACCESS_TOKEN"
+                                    ]
+                                    os.environ["SUPABASE_ACCESS_TOKEN"] = (
+                                        supabase_access_token
+                                    )
+                                    self.logger.info(
+                                        "🔑 Set SUPABASE_ACCESS_TOKEN for MCP server"
+                                    )
+                                if "SUPABASE_PROJECT_ID" in supabase_env:
+                                    os.environ["SUPABASE_PROJECT_ID"] = supabase_env[
+                                        "SUPABASE_PROJECT_ID"
+                                    ]
+                                    self.logger.info(
+                                        "🆔 Set SUPABASE_PROJECT_ID for MCP server"
+                                    )
+
+                            # Set up Brave Search MCP server environment variables
+                            if "brave_search" in mcp_servers:
+                                brave_env = mcp_servers["brave_search"].get("env", {})
+                                if "BRAVE_API_KEY" in brave_env:
+                                    os.environ["BRAVE_API_KEY"] = brave_env[
+                                        "BRAVE_API_KEY"
+                                    ]
+                                    self.logger.info(
+                                        "🔍 Set BRAVE_API_KEY for MCP server"
+                                    )
+
+                            # Set up any other MCP server environment variables
+                            for server_name, server_config in mcp_servers.items():
+                                if "env" in server_config:
+                                    for env_var, env_val in server_config[
+                                        "env"
+                                    ].items():
+                                        if (
+                                            env_var not in os.environ
+                                        ):  # Don't override existing env vars
+                                            os.environ[env_var] = env_val
+                                            self.logger.info(
+                                                f"🔧 Set {env_var} for {server_name} MCP server"
+                                            )
+
+                        # Fallback to legacy supabase section
+                        if (
+                            not anon_key
+                            and not service_role_key
+                            and "supabase" in secrets
+                        ):
                             anon_key = secrets["supabase"].get("anon_key")
                             service_role_key = secrets["supabase"].get(
                                 "service_role_key"
                             )
                             supabase_url = secrets["supabase"].get("url")
                             self.logger.info(
-                                f"📄 Loaded Supabase credentials from {secrets_file}"
+                                f"📄 Loaded Supabase credentials from supabase section in {secrets_file}"
                             )
+
+                        if anon_key or service_role_key:
                             break
 
             # Fallback to environment variables
@@ -131,7 +202,7 @@ class ModularSlackMetaAgent:
                     enable_metrics=True,
                 )
                 self.logger.info(
-                    "⚡ High-performance Supabase pool manager initialized"
+                    "⚡ High-performance Supabase pool manager initialized with credentials"
                 )
             else:
                 self.logger.warning("⚠️ Missing Supabase credentials or project ID")
@@ -509,6 +580,7 @@ async def main():
 
                     # Load Supabase project ID
                     if not supabase_project_id:
+                        # First try the MCP section
                         if (
                             "mcp" in secrets
                             and "servers" in secrets["mcp"]
@@ -517,6 +589,18 @@ async def main():
                             supabase_project_id = secrets["mcp"]["servers"]["supabase"][
                                 "env"
                             ].get("SUPABASE_PROJECT_ID")
+                        # Then try the TRIBEsupabase section
+                        elif "TRIBEsupabase" in secrets:
+                            supabase_url = secrets["TRIBEsupabase"].get("url")
+                            if supabase_url:
+                                import re
+
+                                match = re.search(
+                                    r"https://([^.]+)\.supabase\.co", supabase_url
+                                )
+                                if match:
+                                    supabase_project_id = match.group(1)
+                        # Finally try the legacy supabase section
                         elif "supabase" in secrets:
                             # Extract from URL if available
                             supabase_url = secrets["supabase"].get("url")

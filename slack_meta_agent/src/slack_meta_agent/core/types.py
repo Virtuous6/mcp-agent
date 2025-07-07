@@ -136,11 +136,9 @@ class AgentSpec:
     instruction: str
     server_names: List[str]
     capabilities: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Dynamic configuration
     is_dynamic: bool = False
-    database_id: Optional[str] = None
 
 
 @dataclass

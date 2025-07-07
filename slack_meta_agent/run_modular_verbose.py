@@ -95,11 +95,14 @@ async def main():
     # Set up verbose logging first
     setup_verbose_logging()
 
+    # Set the missing SUPABASE_PROJECT_ID environment variable
+    if not os.getenv("SUPABASE_PROJECT_ID"):
+        os.environ["SUPABASE_PROJECT_ID"] = "qqggdvfeybfzqmgxmidt"
+        print(f"🔧 Set SUPABASE_PROJECT_ID environment variable: qqggdvfeybfzqmgxmidt")
+
     try:
-        # Import and run the modular system
-        from slack_meta_agent.src.slack_meta_agent.main_modular import (
-            main as modular_main,
-        )
+        # Import and run the modular system with correct path
+        from src.slack_meta_agent.main_modular import main as modular_main
 
         await modular_main()
     except KeyboardInterrupt:

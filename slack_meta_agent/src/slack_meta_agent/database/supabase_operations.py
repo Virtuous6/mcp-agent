@@ -180,6 +180,89 @@ class SupabaseOperations:
     async def discover_mcp_servers(self, keywords: List[str]) -> List[Dict]:
         """Discover MCP servers from database based on keywords"""
         try:
+            # Try direct client method first if available
+            if self.direct_client:
+                self.logger.info("✅ Using direct client for server discovery")
+                return await self._discover_servers_direct(keywords)
+
+            # Fallback to MCP method if direct client not available
+            self.logger.info("🔄 Using MCP method for server discovery")
+            return await self._discover_servers_via_mcp(keywords)
+
+        except Exception as e:
+            self.logger.error(f"❌ MCP server discovery error: {e}")
+            return []
+
+    async def _discover_servers_direct(self, keywords: List[str]) -> List[Dict]:
+        """Discover servers using direct HTTP API calls"""
+        try:
+            import aiohttp
+
+            # Simple approach: query for any server matching arc_supabase specifically,
+            # or if no specific matches, return all servers and filter in Python
+            url = f"https://{self.supabase_project_id}.supabase.co/rest/v1/mcp_servers"
+
+            # If looking for arc_supabase specifically, use exact match
+            if any("arc" in k.lower() for k in keywords):
+                params = {
+                    "select": "server_name,display_name,description,transport,url,command,args",
+                    "server_name": "eq.arc_supabase",
+                    "is_enabled": "eq.true",
+                }
+            else:
+                # Otherwise get all servers and filter in Python
+                params = {
+                    "select": "server_name,display_name,description,transport,url,command,args",
+                    "is_enabled": "eq.true",
+                }
+
+            headers = {
+                "apikey": self.direct_client.api_key,
+                "Authorization": f"Bearer {self.direct_client.api_key}",
+                "Content-Type": "application/json",
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        all_servers = await response.json()
+
+                        # Filter servers based on keywords
+                        matching_servers = []
+                        for server in all_servers:
+                            server_name = server.get("server_name", "").lower()
+                            display_name = server.get("display_name", "").lower()
+                            description = server.get("description", "").lower()
+
+                            # Check if any keyword matches
+                            for keyword in keywords:
+                                keyword_lower = keyword.lower()
+                                if (
+                                    keyword_lower in server_name
+                                    or keyword_lower in display_name
+                                    or keyword_lower in description
+                                ):
+                                    matching_servers.append(server)
+                                    break
+
+                        self.logger.info(
+                            f"✅ Direct discovery found {len(matching_servers)} matching servers out of {len(all_servers)} total"
+                        )
+                        return matching_servers
+                    else:
+                        error_text = await response.text()
+                        self.logger.error(
+                            f"❌ Direct discovery failed: {response.status} - {error_text}"
+                        )
+                        return []
+
+        except Exception as e:
+            self.logger.error(f"❌ Direct server discovery error: {e}")
+            return []
+
+    async def _discover_servers_via_mcp(self, keywords: List[str]) -> List[Dict]:
+        """Discover servers using MCP agent method (fallback)"""
+        try:
             # Build search query
             keyword_conditions = []
             for keyword in keywords:

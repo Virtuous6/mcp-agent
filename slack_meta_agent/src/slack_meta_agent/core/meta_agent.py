@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Any, Set
 from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+from .llm_factory import SmartLLMFactory, create_smart_llm_factory
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
 from mcp_agent.human_input.types import HumanInputRequest, HumanInputResponse
 
@@ -311,7 +312,7 @@ class SlackMetaAgent:
                         instruction=agent_data["instruction"],
                         server_names=server_names,
                         capabilities=agent_data.get("capabilities", []),
-                        metadata=agent_data.get("metadata", {}),
+                        is_dynamic=True,
                     )
 
                 self.logger.info(
@@ -3357,7 +3358,9 @@ Reply in this thread to continue...
                         return await self._perform_capability_introspection()
 
                 async with agent:
-                    llm = await agent.attach_llm(OpenAIAugmentedLLM)
+                    # Use smart LLM factory that respects agent's database configuration
+                    llm_factory = create_smart_llm_factory(agent)
+                    llm = await agent.attach_llm(llm_factory)
                     result = await llm.generate_str(message)
                     return result
 
@@ -3651,7 +3654,9 @@ Reply in this thread to continue...
                         )
 
                         async with step_agent:
-                            llm = await step_agent.attach_llm(OpenAIAugmentedLLM)
+                            # Use smart LLM factory for database-driven configuration
+                            llm_factory = create_smart_llm_factory(step_agent)
+                            llm = await step_agent.attach_llm(llm_factory)
 
                             # Create step-specific prompt
                             step_prompt = f"""
@@ -5618,7 +5623,9 @@ Is there anything else you'd like to share or any other feedback you have?"""
             )
 
             async with agent:
-                llm = await agent.attach_llm(OpenAIAugmentedLLM)
+                # Use smart LLM factory for database-driven configuration
+                llm_factory = create_smart_llm_factory(agent)
+                llm = await agent.attach_llm(llm_factory)
                 enhanced_prompt = f"""
                 Original request: {message}
                 

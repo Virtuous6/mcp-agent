@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
+from ..core.llm_factory import SmartLLMFactory, create_smart_llm_factory
 
 from ..core.types import AgentComponent
 
@@ -336,7 +337,9 @@ class WorkflowManagerAgent(AgentComponent):
                         )
 
                         async with step_agent:
-                            llm = await step_agent.attach_llm(OpenAIAugmentedLLM)
+                            # Use smart LLM factory for database-driven configuration
+                            llm_factory = create_smart_llm_factory(step_agent)
+                            llm = await step_agent.attach_llm(llm_factory)
 
                             # Create step-specific prompt
                             step_prompt = f"""

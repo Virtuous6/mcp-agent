@@ -12,11 +12,14 @@ Extracted from SlackMetaAgent to provide clean separation of concerns.
 
 import asyncio
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
+import time
 
 from mcp_agent.agents.agent import Agent
 
 from ..core.types import AgentSpec, AgentComponent
+from ..models import EnhancedAgentSpec
+from ..core.llm_factory import SmartLLMFactory, create_smart_llm_factory
 
 
 class PoolManagerAgent(AgentComponent):
@@ -60,6 +63,13 @@ class PoolManagerAgent(AgentComponent):
         self.pool_misses = 0
         self.health_check_failures = 0
         self.recoveries_performed = 0
+
+        # New attributes for enhanced agent support
+        self.agent_pools: Dict[str, List[Agent]] = {}
+        self.active_agents: Dict[str, Agent] = {}
+        self.agent_metadata: Dict[str, Dict[str, Any]] = {}
+        self._allocations = 0
+        self._creation_times: List[float] = []
 
     async def initialize(self) -> bool:
         """Initialize the agent pool with commonly used agents."""
@@ -170,6 +180,14 @@ class PoolManagerAgent(AgentComponent):
                 instruction=agent_spec.instruction,
                 server_names=agent_spec.server_names,
             )
+
+        # Add LLM configuration from agent spec if available
+        if hasattr(agent_spec, "llm_model"):
+            agent.llm_config = {
+                "model": getattr(agent_spec, "llm_model", "gpt-4o-mini"),
+                "temperature": getattr(agent_spec, "temperature", 0.3),
+                "max_tokens": getattr(agent_spec, "max_tokens", 2000),
+            }
 
         # Initialize isolated conversation context
         self._initialize_request_conversation(request_id, agent_type)
@@ -469,6 +487,81 @@ class PoolManagerAgent(AgentComponent):
 
         return default_specs.get(agent_type)
 
+    async def find_servers_by_keywords(self, keywords: List[str]) -> Dict[str, Any]:
+        """Find MCP servers from database based on keywords."""
+        try:
+            self.logger.info(
+                f"🔍 PoolManager searching for servers with keywords: {keywords}"
+            )
+
+            # Import here to avoid circular imports
+            from ..database.supabase_operations import SupabaseOperations
+            import os
+
+            # Get Supabase project ID from environment or config
+            project_id = os.getenv("SUPABASE_PROJECT_ID", "qqggdvfeybfzqmgxmidt")
+
+            # Try to get credentials from secrets
+            try:
+                from pathlib import Path
+                import yaml
+
+                secrets_file = (
+                    Path(__file__).parent.parent.parent
+                    / "config"
+                    / "mcp_agent.secrets.yaml"
+                )
+                if secrets_file.exists():
+                    with open(secrets_file, "r") as f:
+                        secrets = yaml.safe_load(f)
+
+                    # Get Supabase credentials
+                    supabase_config = secrets.get("TRIBEsupabase", {})
+                    anon_key = supabase_config.get("anon_key")
+                    service_role_key = supabase_config.get("service_role_key")
+
+                    # Create database operations with credentials
+                    db_ops = SupabaseOperations(
+                        supabase_project_id=project_id,
+                        anon_key=anon_key,
+                        service_role_key=service_role_key,
+                    )
+                else:
+                    # Fallback without credentials (will use MCP method)
+                    db_ops = SupabaseOperations(supabase_project_id=project_id)
+
+            except Exception as e:
+                self.logger.warning(f"Could not load secrets: {e}, using MCP method")
+                db_ops = SupabaseOperations(supabase_project_id=project_id)
+
+            # Discover servers from database
+            servers = await db_ops.discover_mcp_servers(keywords)
+
+            if servers:
+                self.logger.info(f"✅ Found {len(servers)} servers matching keywords")
+                return {
+                    "success": True,
+                    "data": servers,
+                    "method": "database_discovery",
+                }
+            else:
+                self.logger.info("No servers found in database for keywords")
+                return {
+                    "success": False,
+                    "data": [],
+                    "error": "No matching servers found",
+                    "method": "database_discovery",
+                }
+
+        except Exception as e:
+            self.logger.error(f"❌ Server discovery error: {e}")
+            return {
+                "success": False,
+                "data": [],
+                "error": str(e),
+                "method": "database_discovery_failed",
+            }
+
     async def health_check(self) -> Dict[str, Any]:
         """Check component health."""
         base_health = await super().health_check()
@@ -497,3 +590,95 @@ class PoolManagerAgent(AgentComponent):
                 for agent_type in self.agent_usage_stats.keys()
             },
         }
+
+    async def _create_agent_from_enhanced_spec(
+        self, spec: EnhancedAgentSpec, request_id: str
+    ) -> Optional[Agent]:
+        """Create agent with enhanced configuration and smart LLM factory."""
+
+        # Build rich instruction from spec
+        instruction = spec.build_instruction()
+
+        try:
+            agent = Agent(
+                name=f"{spec.id}_{request_id}",
+                instruction=instruction,
+                server_names=spec.tools,
+                context=self.mcp_app.context if self.mcp_app else None,
+            )
+
+            # Configure LLM with spec parameters from database
+            agent.llm_config = {
+                "model": spec.llm_model,
+                "temperature": spec.temperature,
+                "max_tokens": spec.max_tokens,
+                "provider": spec.llm_provider,
+                "timeout_ms": spec.timeout_ms,
+                "allow_delegation": spec.allow_delegation,
+            }
+
+            # Store metadata including enhanced spec info
+            self.agent_metadata[agent.name] = {
+                "spec_id": spec.id,
+                "created_at": datetime.now(),
+                "llm_model": spec.llm_model,
+                "llm_provider": spec.llm_provider,
+                "temperature": spec.temperature,
+                "max_tokens": spec.max_tokens,
+                "allow_delegation": spec.allow_delegation,
+                "timeout_ms": spec.timeout_ms,
+                "role": spec.role,
+                "goal": spec.goal,
+                "version": spec.version,
+            }
+
+            self.logger.info(
+                f"✅ Created enhanced agent {agent.name} with model {spec.llm_model} "
+                f"(temp: {spec.temperature}, tokens: {spec.max_tokens})"
+            )
+            return agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create enhanced agent {spec.id}: {e}")
+            return None
+
+    async def create_agent(self, agent_type: str, request_id: str) -> Optional[Agent]:
+        """Create an agent from specification with enhanced support."""
+
+        # First try to get enhanced spec
+        if self.registry and hasattr(self.registry, "load_agent_spec"):
+            enhanced_spec = await self.registry.load_agent_spec(agent_type)
+            if enhanced_spec:
+                return await self._create_agent_from_enhanced_spec(
+                    enhanced_spec, request_id
+                )
+
+        # Fallback to legacy creation
+        spec = await self._get_agent_spec(agent_type)
+        if not spec:
+            self.logger.error(f"No specification found for agent type: {agent_type}")
+            return None
+
+        start_time = time.time()
+
+        try:
+            agent = Agent(
+                name=f"{agent_type}_{request_id}",
+                instruction=spec.instruction,
+                server_names=spec.server_names,
+                context=self.mcp_app.context if self.mcp_app else None,
+            )
+
+            creation_time = time.time() - start_time
+            self._creation_times.append(creation_time)
+
+            # Keep only last 100 creation times for metrics
+            if len(self._creation_times) > 100:
+                self._creation_times = self._creation_times[-100:]
+
+            self.logger.info(f"Created agent {agent.name} in {creation_time:.2f}s")
+            return agent
+
+        except Exception as e:
+            self.logger.error(f"Failed to create agent {agent_type}: {e}")
+            return None

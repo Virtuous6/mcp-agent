@@ -15,6 +15,7 @@ from mcp_agent.app import MCPApp
 from mcp_agent.agents.agent import Agent
 from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 from mcp_agent.workflows.orchestrator.orchestrator import Orchestrator
+from slack_meta_agent.core.llm_factory import SmartLLMFactory, create_smart_llm_factory
 from mcp_agent.human_input.handler import console_input_callback
 from mcp_agent.human_input.types import HumanInputRequest, HumanInputResponse
 from rich import print
@@ -2126,7 +2127,9 @@ class SlackMetaAgent:
             )
 
             async with agent:
-                llm = await agent.attach_llm(OpenAIAugmentedLLM)
+                # Use smart LLM factory for database-driven configuration
+                llm_factory = create_smart_llm_factory(agent)
+                llm = await agent.attach_llm(llm_factory)
                 enhanced_prompt = f"""
                 Original request: {message}
                 

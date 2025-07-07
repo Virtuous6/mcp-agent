@@ -22,6 +22,15 @@ mcp:
       command: "npx"
       args: ["-y", "@supabase/mcp-server-supabase@latest"]
       description: "Access Supabase API operations"
+      env:
+        SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}"
+        SUPABASE_PROJECT_ID: "${SUPABASE_PROJECT_ID}"
+
+    # GHL Dynamic server (placeholder - replace with actual endpoint if available)
+    ghl-dynamic:
+      transport: "sse"
+      url: "https://placeholder.example.com/mcp/ghl/sse"
+      description: "GHL Dynamic server (placeholder - configure with actual endpoint)"
 
     # Essential utility servers
     filesystem:
@@ -49,6 +58,8 @@ mcp:
     brave_search:
       command: "npx"
       args: ["-y", "@modelcontextprotocol/server-brave-search"]
+      env:
+        BRAVE_API_KEY: "${BRAVE_API_KEY}"
 
     # n8n automation and workflow server via MCP endpoint
     Airtable:
@@ -58,6 +69,8 @@ mcp:
 
 openai:
   default_model: gpt-4o
+  max_tokens: 2000 # Limit response tokens to save context space
+  max_context_tokens: 100000 # Limit input context to prevent overflow
 
 human_input:
   enabled: true
