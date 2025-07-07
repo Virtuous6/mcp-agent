@@ -2,8 +2,8 @@
 Agent specification dataclass for the Slack Meta-Agent system
 """
 
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
 
 
 @dataclass
@@ -14,3 +14,4 @@ class AgentSpec:
     instruction: str
     server_names: List[str]
     capabilities: List[str]
+    metadata: Dict[str, Any] = field(default_factory=dict)
