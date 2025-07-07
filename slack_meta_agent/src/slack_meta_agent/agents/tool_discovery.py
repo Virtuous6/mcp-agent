@@ -242,6 +242,12 @@ class ToolDiscoveryAgent(AgentComponent):
             "parameter_types": self._analyze_parameter_types(tools),
         }
 
+    def get_cached_catalog(self) -> Optional[ToolCatalog]:
+        """Get the cached tool catalog without triggering discovery."""
+        if self._is_cache_valid():
+            return self._tool_catalog
+        return None
+
     def invalidate_cache(self) -> None:
         """Manually invalidate the tool catalog cache."""
         self._tool_catalog = None

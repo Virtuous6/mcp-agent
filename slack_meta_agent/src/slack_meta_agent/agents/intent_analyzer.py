@@ -45,7 +45,18 @@ class IntentAnalyzerAgent(AgentComponent):
         self.registry = registry
         self.tool_discovery = tool_discovery
         self.pool_manager = pool_manager
-        self.config = config or self._default_config()
+        # Ensure config is a dictionary
+        if config is None:
+            self.config = self._default_config()
+        elif hasattr(config, "__getitem__"):
+            # Already dict-like
+            self.config = config
+        else:
+            # Convert config object to dict or use default
+            try:
+                self.config = dict(config) if config else self._default_config()
+            except:
+                self.config = self._default_config()
 
         # Legacy pattern support (for backwards compatibility)
         self.patterns = self._load_default_patterns()
@@ -81,7 +92,12 @@ class IntentAnalyzerAgent(AgentComponent):
 
         self.logger.info(f"🔍 Analyzing intent for: {text[:50]}...")
 
+        # Debug logging for troubleshooting
+        if text.lower().strip() in ["hello", "hi", "hey"]:
+            self.logger.info(f"🐛 DEBUG: Processing simple greeting: '{text}'")
+
         # PRIORITY 1: MCP server addition requests
+        self.logger.info("🐛 DEBUG: Checking MCP server addition...")
         if self._is_mcp_server_addition_request(text):
             self.logger.info("🔧 PRIORITY: MCP server addition detected")
             return Intent(
@@ -95,6 +111,7 @@ class IntentAnalyzerAgent(AgentComponent):
             )
 
         # PRIORITY 2: Feedback requests
+        self.logger.info("🐛 DEBUG: Checking feedback requests...")
         feedback_info = self._parse_feedback_from_message(text)
         if feedback_info["has_feedback"] or any(
             pattern in text.lower()
@@ -120,7 +137,9 @@ class IntentAnalyzerAgent(AgentComponent):
             )
 
         # PRIORITY 3: Workflow triggers (database-driven)
+        self.logger.info("🐛 DEBUG: Checking workflow triggers...")
         if self._workflow_checker:
+            self.logger.info("🐛 DEBUG: Workflow checker exists, checking triggers...")
             workflow_match = await self._workflow_checker.check_triggers(text, context)
             if workflow_match:
                 workflow = workflow_match["workflow"]

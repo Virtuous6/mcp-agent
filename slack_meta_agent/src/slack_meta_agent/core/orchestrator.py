@@ -133,15 +133,15 @@ class Orchestrator(AgentComponent):
 
             # Create final result
             final_result = ExecutionResult(
+                success=True,
                 response=result,
                 execution_time=execution_time,
                 intent_confidence=intent.confidence,
-                complexity=intent.complexity,
                 agent_count=len(intent.required_agents),
                 metadata={
                     "request_id": request_id,
                     "execution_strategy": intent.execution_strategy.value,
-                    "intent_name": intent.intent_name,
+                    "intent_name": intent.name,
                     "reasoning": intent.reasoning,
                 },
             )
@@ -162,11 +162,12 @@ class Orchestrator(AgentComponent):
             )
 
             return ExecutionResult(
+                success=False,
                 response=f"I encountered an error processing your request: {str(e)}",
                 execution_time=execution_time,
                 intent_confidence=ConfidenceLevel.LOW,
-                complexity="error",
                 agent_count=0,
+                error=str(e),
                 metadata={
                     "request_id": request_id,
                     "error": str(e),
@@ -182,29 +183,37 @@ class Orchestrator(AgentComponent):
     async def _analyze_intent(self, incoming: IncomingMessage) -> Intent:
         """Analyze user intent using the Intent Analyzer."""
         try:
-            # Convert context to dict for intent analyzer
-            context = {
-                "user_id": incoming.context.user_id,
-                "channel_id": incoming.context.channel_id,
-                "platform": incoming.context.platform,
-                "timestamp": incoming.context.timestamp,
-            }
+            self.logger.info(
+                f"🧠 Starting intent analysis for: {incoming.text[:50]}..."
+            )
 
-            return await self.intent_analyzer.analyze(incoming.text, context)
+            # Check if intent analyzer exists
+            if not self.intent_analyzer:
+                self.logger.error("❌ Intent analyzer not initialized!")
+                raise Exception("Intent analyzer not available")
+
+            self.logger.info("🧠 Calling intent analyzer.analyze()...")
+
+            # Pass the full incoming message to intent analyzer
+            intent = await self.intent_analyzer.analyze(incoming)
+
+            self.logger.info(f"✅ Intent analysis completed: {intent.name}")
+            return intent
 
         except Exception as e:
-            self.logger.error(f"Intent analysis failed: {e}")
+            self.logger.error(f"❌ Intent analysis failed: {e}")
+            import traceback
+
+            self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
 
             # Fallback intent
             return Intent(
+                name="fallback",
                 required_agents=["data_researcher"],
                 execution_strategy=ExecutionStrategy.SINGLE_AGENT,
                 confidence=ConfidenceLevel.LOW,
-                complexity="fallback",
-                task_description="Fallback task due to intent analysis failure",
                 reasoning=f"Intent analysis failed: {str(e)}",
-                intent_name="fallback",
-                metadata={"error": str(e)},
+                payload={"error": str(e)},
             )
 
     async def _execute_workflow_strategy(
@@ -305,10 +314,35 @@ class Orchestrator(AgentComponent):
             if agent_type == "capability_inspector":
                 return await self._handle_capability_inspection(incoming.text)
 
+            self.logger.info(f"🤖 Using agent {agent.name} for LLM generation")
+
             async with agent:
-                llm = await agent.attach_llm(OpenAIAugmentedLLM)
-                result = await llm.generate_str(incoming.text)
-                return result
+                self.logger.info(f"🔗 Attaching OpenAI LLM to agent {agent.name}")
+                try:
+                    llm = await agent.attach_llm(OpenAIAugmentedLLM)
+                    self.logger.info(f"✅ LLM attached successfully to {agent.name}")
+                except Exception as llm_error:
+                    self.logger.error(
+                        f"❌ Failed to attach LLM to {agent.name}: {llm_error}"
+                    )
+                    return f"❌ LLM attachment failed: {str(llm_error)}. Check OpenAI API key configuration."
+
+                self.logger.info(
+                    f"🚀 Generating response with LLM for message: {incoming.text[:50]}..."
+                )
+                try:
+                    result = await llm.generate_str(incoming.text)
+                    self.logger.info(
+                        f"✅ LLM response generated successfully (length: {len(result) if result else 0})"
+                    )
+
+                    if not result:
+                        return "❌ LLM returned empty response. Check OpenAI API key and model configuration."
+
+                    return result
+                except Exception as gen_error:
+                    self.logger.error(f"❌ LLM generation failed: {gen_error}")
+                    return f"❌ LLM generation failed: {str(gen_error)}. Check OpenAI API key and quotas."
 
         except Exception as e:
             self.logger.error(f"Single agent execution failed: {e}")
@@ -432,7 +466,7 @@ class Orchestrator(AgentComponent):
         """Handle capability inspection requests."""
         try:
             # Get current tool catalog
-            catalog = await self.tool_discovery.get_cached_catalog()
+            catalog = self.tool_discovery.get_cached_catalog()  # This is not async
 
             # Extract tool name if user is searching for specific tool
             tool_name = self._extract_tool_name(message)
@@ -505,11 +539,13 @@ class Orchestrator(AgentComponent):
 
     async def _format_capability_overview(self, catalog) -> str:
         """Format a general capability overview."""
-        specs = await self.registry.get_specs()
+        specs = await self.registry.get_agent_specs()
 
         overview = "🤖 **Meta-Agent System Capabilities**\n\n"
         overview += f"**Available Agents:** {len(specs)}\n"
-        overview += f"**Total Tools:** {catalog.get('total_tools', 'Unknown') if catalog else 'Unknown'}\n\n"
+        overview += (
+            f"**Total Tools:** {catalog.total_tools if catalog else 'Unknown'}\n\n"
+        )
 
         overview += "**Specialized Agents:**\n"
         for agent_type, spec in specs.items():

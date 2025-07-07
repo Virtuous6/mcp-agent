@@ -17,7 +17,12 @@ from mcp_agent.workflows.llm.augmented_llm_openai import OpenAIAugmentedLLM
 class SupabaseOperations:
     """Handles all Supabase database operations for the meta-agent system"""
 
-    def __init__(self, supabase_project_id: str):
+    def __init__(
+        self,
+        supabase_project_id: str,
+        anon_key: str = None,
+        service_role_key: str = None,
+    ):
         self.supabase_project_id = supabase_project_id
         self.logger = logging.getLogger("SupabaseOperations")
 
@@ -27,8 +32,12 @@ class SupabaseOperations:
             # This would import the existing SupabaseDirectClient
             from .supabase_client import SupabaseDirectClient
 
-            # Initialize with credentials from environment or secrets
-            self.direct_client = SupabaseDirectClient(project_id=supabase_project_id)
+            # Initialize with provided credentials
+            self.direct_client = SupabaseDirectClient(
+                project_id=supabase_project_id,
+                anon_key=anon_key,
+                service_role_key=service_role_key,
+            )
             self.logger.info("✅ Direct Supabase client initialized")
         except Exception as e:
             self.logger.warning(f"⚠️ Could not initialize direct client: {e}")

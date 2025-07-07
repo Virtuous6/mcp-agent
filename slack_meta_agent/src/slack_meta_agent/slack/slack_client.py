@@ -69,8 +69,16 @@ class SlackClientManager:
 
         try:
             self.logger.info("🚀 Starting Slack WebSocket connection...")
-            self.socket_client.connect()
+
+            # Run the blocking connect call in a thread pool to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.socket_client.connect)
+
             self.logger.info("✅ Connected to Slack! Meta-Agent is ready.")
+
+            # Give the connection a moment to stabilize
+            await asyncio.sleep(1)
+
         except Exception as e:
             self.logger.error(f"Failed to connect to Slack: {e}")
             raise
@@ -109,9 +117,17 @@ class SlackClientManager:
                 and not self.event_loop.is_closed()
                 and self.message_handler
             ):
-                asyncio.run_coroutine_threadsafe(
-                    self.message_handler(event), self.event_loop
-                )
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_handler(event), self.event_loop
+                    )
+                except RuntimeError as e:
+                    if "shutdown" in str(e):
+                        self.logger.warning(
+                            "Event loop is shutting down, ignoring event"
+                        )
+                    else:
+                        self.logger.error(f"Error scheduling event handler: {e}")
 
         elif req.type == "slash_commands":
             # Acknowledge slash commands immediately
@@ -126,16 +142,24 @@ class SlackClientManager:
                 and not self.event_loop.is_closed()
                 and self.message_handler
             ):
-                # Convert slash command to event format
-                event = {
-                    "type": "message",
-                    "user": command_data.get("user_id", ""),
-                    "channel": command_data.get("channel_id", ""),
-                    "text": command_data.get("text", ""),
-                }
-                asyncio.run_coroutine_threadsafe(
-                    self.message_handler(event), self.event_loop
-                )
+                try:
+                    # Convert slash command to event format
+                    event = {
+                        "type": "message",
+                        "user": command_data.get("user_id", ""),
+                        "channel": command_data.get("channel_id", ""),
+                        "text": command_data.get("text", ""),
+                    }
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_handler(event), self.event_loop
+                    )
+                except RuntimeError as e:
+                    if "shutdown" in str(e):
+                        self.logger.warning(
+                            "Event loop is shutting down, ignoring command"
+                        )
+                    else:
+                        self.logger.error(f"Error scheduling command handler: {e}")
 
         else:
             # Acknowledge other request types

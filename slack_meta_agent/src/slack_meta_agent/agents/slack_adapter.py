@@ -114,11 +114,29 @@ class SlackAdapterAgent(AgentComponent):
 
             # Normalize to platform-agnostic message
             incoming_message = self._normalize_slack_message(event)
+            self.logger.info(
+                f"🔄 Normalized message: '{incoming_message.text}' from user {user_id}"
+            )
 
             # Send to orchestrator
             if self.orchestrator:
-                result = await self.orchestrator.handle(incoming_message)
-                await self._send_result_to_slack(result, incoming_message.context)
+                self.logger.info(
+                    f"📨 Sending message to orchestrator: {incoming_message.text[:50]}..."
+                )
+                try:
+                    result = await self.orchestrator.handle(incoming_message)
+                    self.logger.info(
+                        f"✅ Orchestrator returned result: {len(result.response) if result and result.response else 0} chars"
+                    )
+                    await self._send_result_to_slack(result, incoming_message.context)
+                    self.logger.info(f"📤 Response sent to Slack successfully")
+                except Exception as orch_error:
+                    self.logger.error(f"❌ Orchestrator failed: {orch_error}")
+                    await self._send_error_to_slack(
+                        f"Internal processing error: {str(orch_error)}",
+                        channel_id,
+                        message_ts,
+                    )
             else:
                 self.logger.error("No orchestrator available to handle message")
                 await self._send_error_to_slack(

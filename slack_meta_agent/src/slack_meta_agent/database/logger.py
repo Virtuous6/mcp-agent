@@ -386,8 +386,16 @@ class SupabaseSessionLogHandler(logging.Handler):
         """Filter out noisy logs that clutter the database - AGGRESSIVE filtering"""
 
         # Allow logs from our app loggers and critical errors
-        if record.name in ["SlackMetaAgent", "mcp_agent"] or record.name.startswith(
-            "mcp_agent."
+        if (
+            record.name in ["SlackMetaAgent", "mcp_agent"]
+            or record.name.startswith("mcp_agent.")
+            or record.name.startswith(
+                "slack_meta_agent."
+            )  # Allow all slack_meta_agent logs
+            or "Orchestrator" in record.name  # Show orchestrator activity
+            or "Agent" in record.name  # Show all agent activity
+            or "SlackAdapter" in record.name  # Show Slack events
+            or "IntentAnalyzer" in record.name  # Show intent analysis
         ):
             return False  # Always allow our app logs
 
@@ -637,8 +645,14 @@ class FilteredConsoleHandler(logging.StreamHandler):
     def _should_filter_log(self, record: logging.LogRecord) -> bool:
         """Filter out noisy logs - SUPER CLEAN console output"""
 
-        # Only show SlackMetaAgent logs and critical errors
-        if record.name == "SlackMetaAgent":
+        # Show SlackMetaAgent logs and critical errors
+        if (
+            record.name == "SlackMetaAgent"
+            or record.name.startswith("slack_meta_agent.")  # Show agent activity
+            or "Orchestrator" in record.name  # Show orchestrator
+            or "Agent" in record.name  # Show all agents
+            or "SlackAdapter" in record.name  # Show Slack events
+        ):
             return False  # Always show our app logs
 
         # Always show critical errors

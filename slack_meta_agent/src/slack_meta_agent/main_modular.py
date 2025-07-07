@@ -11,7 +11,11 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from mcp_agent.app import MCPApp
+try:
+    from mcp_agent.app import MCPApp
+except ImportError:
+    # Handle case where MCPApp is not available due to circular imports
+    MCPApp = None
 
 from .core.orchestrator import Orchestrator
 from .agents.intent_analyzer import IntentAnalyzerAgent
@@ -45,8 +49,8 @@ class ModularSlackMetaAgent:
         self.config = ConfigLoader()
         self.slack_manager = SlackClientManager()
 
-        # Database components
-        self.db_ops = SupabaseOperations(supabase_project_id)
+        # Database components (will be re-initialized with credentials later)
+        self.db_ops = None
         self.pool_manager: Optional[SupabasePoolManager] = None
 
         # Micro-agents
@@ -67,6 +71,7 @@ class ModularSlackMetaAgent:
             # Load credentials from secrets file or environment
             anon_key = None
             service_role_key = None
+            supabase_url = None
 
             # Try to load from secrets YAML file
             secrets_paths = [
@@ -86,6 +91,7 @@ class ModularSlackMetaAgent:
                             service_role_key = secrets["supabase"].get(
                                 "service_role_key"
                             )
+                            supabase_url = secrets["supabase"].get("url")
                             self.logger.info(
                                 f"📄 Loaded Supabase credentials from {secrets_file}"
                             )
@@ -95,8 +101,27 @@ class ModularSlackMetaAgent:
             if not anon_key and not service_role_key:
                 anon_key = os.getenv("SUPABASE_ANON_KEY")
                 service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                supabase_url = os.getenv("SUPABASE_URL")
 
-            if anon_key or service_role_key:
+            # Extract project ID from URL if not provided
+            if not self.supabase_project_id and supabase_url:
+                import re
+
+                match = re.search(r"https://([^.]+)\.supabase\.co", supabase_url)
+                if match:
+                    self.supabase_project_id = match.group(1)
+                    self.logger.info(
+                        f"📍 Extracted project ID: {self.supabase_project_id}"
+                    )
+
+            if (anon_key or service_role_key) and self.supabase_project_id:
+                # Update the database operations with credentials
+                self.db_ops = SupabaseOperations(
+                    supabase_project_id=self.supabase_project_id,
+                    anon_key=anon_key,
+                    service_role_key=service_role_key,
+                )
+
                 self.pool_manager = SupabasePoolManager(
                     project_id=self.supabase_project_id,
                     anon_key=anon_key,
@@ -108,9 +133,21 @@ class ModularSlackMetaAgent:
                 self.logger.info(
                     "⚡ High-performance Supabase pool manager initialized"
                 )
+            else:
+                self.logger.warning("⚠️ Missing Supabase credentials or project ID")
+                # Create a fallback db_ops without credentials
+                if self.supabase_project_id:
+                    self.db_ops = SupabaseOperations(
+                        supabase_project_id=self.supabase_project_id
+                    )
 
         except Exception as e:
             self.logger.warning(f"⚠️ Could not initialize database pool: {e}")
+            # Ensure we have a db_ops even if pool fails
+            if not self.db_ops and self.supabase_project_id:
+                self.db_ops = SupabaseOperations(
+                    supabase_project_id=self.supabase_project_id
+                )
 
     async def initialize(self) -> bool:
         """Initialize all micro-agents and wire them together."""
@@ -364,7 +401,7 @@ class ModularSlackMetaAgent:
 
 # Factory function for easy instantiation
 async def create_modular_slack_meta_agent(
-    supabase_project_id: str = None, mcp_app: MCPApp = None
+    supabase_project_id: str = None, mcp_app: MCPApp = None, config_path: str = None
 ) -> ModularSlackMetaAgent:
     """
     Factory function to create and initialize a ModularSlackMetaAgent.
@@ -372,10 +409,43 @@ async def create_modular_slack_meta_agent(
     Args:
         supabase_project_id: Supabase project ID for database operations
         mcp_app: MCPApp instance with configured servers
+        config_path: Path to MCP configuration file
 
     Returns:
         Initialized ModularSlackMetaAgent instance
     """
+    # If no MCPApp is provided, create one from config
+    if mcp_app is None and MCPApp is not None:
+        # Try to find config file
+        config_file = config_path or "config/mcp_agent.config.yaml"
+        if not os.path.exists(config_file):
+            config_file = "mcp_agent.config.yaml"
+        if not os.path.exists(config_file):
+            config_file = "slack_meta_agent/config/mcp_agent.config.yaml"
+
+        if os.path.exists(config_file):
+            try:
+                # Create MCPApp from config
+                import logging
+
+                logger = logging.getLogger("ModularSlackMetaAgent.Factory")
+                logger.info(f"🔧 Creating MCPApp from config: {config_file}")
+
+                mcp_app = MCPApp(
+                    name="slack_meta_agent_modular",
+                    settings=config_file,  # Pass config file path as settings
+                )
+                await mcp_app.initialize()
+                logger.info("✅ MCPApp created and initialized successfully")
+            except Exception as e:
+                import logging
+
+                logger = logging.getLogger("ModularSlackMetaAgent.Factory")
+                logger.warning(f"⚠️ Failed to create MCPApp from config: {e}")
+                logger.info(
+                    "🔄 Continuing without MCPApp - some features will be limited"
+                )
+
     agent = ModularSlackMetaAgent(supabase_project_id, mcp_app)
 
     success = await agent.initialize()
@@ -389,19 +459,84 @@ async def create_modular_slack_meta_agent(
 async def main():
     """Example usage of the modular system."""
     import os
+    import yaml
 
-    # Get configuration from environment
+    # Get configuration from environment variables first
     supabase_project_id = os.getenv("SUPABASE_PROJECT_ID")
     slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
     slack_app_token = os.getenv("SLACK_APP_TOKEN")
 
+    # If environment variables are not set, try to load from secrets file
     if not all([supabase_project_id, slack_bot_token, slack_app_token]):
-        print("❌ Missing required environment variables")
+        print("📄 Environment variables not found, trying to load from secrets file...")
+
+        # Try to load from secrets YAML file
+        secrets_paths = [
+            "config/mcp_agent.secrets.yaml",
+            "mcp_agent.secrets.yaml",
+            "slack_meta_agent/config/mcp_agent.secrets.yaml",
+        ]
+
+        for secrets_file in secrets_paths:
+            if os.path.exists(secrets_file):
+                print(f"📄 Loading credentials from {secrets_file}")
+                with open(secrets_file, "r") as f:
+                    secrets = yaml.safe_load(f)
+
+                    # Load Slack credentials
+                    if "slack" in secrets:
+                        slack_config = secrets["slack"]
+                        slack_bot_token = slack_bot_token or slack_config.get(
+                            "bot_token"
+                        )
+                        slack_app_token = slack_app_token or slack_config.get(
+                            "app_token"
+                        )
+
+                    # Load Supabase project ID
+                    if not supabase_project_id:
+                        if (
+                            "mcp" in secrets
+                            and "servers" in secrets["mcp"]
+                            and "supabase" in secrets["mcp"]["servers"]
+                        ):
+                            supabase_project_id = secrets["mcp"]["servers"]["supabase"][
+                                "env"
+                            ].get("SUPABASE_PROJECT_ID")
+                        elif "supabase" in secrets:
+                            # Extract from URL if available
+                            supabase_url = secrets["supabase"].get("url")
+                            if supabase_url:
+                                import re
+
+                                match = re.search(
+                                    r"https://([^.]+)\.supabase\.co", supabase_url
+                                )
+                                if match:
+                                    supabase_project_id = match.group(1)
+
+                    print(f"✅ Loaded credentials from {secrets_file}")
+                    break
+
+    if not all([supabase_project_id, slack_bot_token, slack_app_token]):
+        print("❌ Missing required configuration:")
+        if not supabase_project_id:
+            print("  - SUPABASE_PROJECT_ID")
+        if not slack_bot_token:
+            print("  - SLACK_BOT_TOKEN")
+        if not slack_app_token:
+            print("  - SLACK_APP_TOKEN")
+        print(
+            "\nPlease set environment variables or configure slack_meta_agent/config/mcp_agent.secrets.yaml"
+        )
         return
 
     try:
-        # Create and initialize the modular agent
-        agent = await create_modular_slack_meta_agent(supabase_project_id)
+        # Create and initialize the modular agent with MCP servers
+        agent = await create_modular_slack_meta_agent(
+            supabase_project_id=supabase_project_id,
+            config_path="config/mcp_agent.config.yaml",
+        )
 
         # Initialize Slack
         slack_success = await agent.initialize_slack(slack_bot_token, slack_app_token)
@@ -421,9 +556,22 @@ async def main():
         print("🚀 Starting Slack connection...")
         await agent.start_slack_connection()
 
+        # Keep the program running to maintain Slack connection
+        print("✅ Slack connection established! Press Ctrl+C to stop.")
+        print("🤖 Try mentioning your bot in Slack: @tomas hello")
+
+        try:
+            # Keep the event loop running indefinitely
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\n🛑 Shutting down...")
+            await agent.cleanup()
+
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
-        await agent.cleanup()
+        if "agent" in locals():
+            await agent.cleanup()
     except Exception as e:
         print(f"❌ Error: {e}")
         if "agent" in locals():
